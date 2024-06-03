@@ -16,6 +16,16 @@
 #include "fuse_misc.h"
 #include "fuse_kernel.h"
 
+#include "libvduse.h"
+#include "standard-headers/linux/virtio_fs.h"
+#include "standard-headers/linux/virtio_ring.h"
+#include <standard-headers/linux/vdpa.h>
+
+#include <netlink/socket.h>
+#include <netlink/genl/genl.h>
+#include <netlink/genl/ctrl.h>
+
+#define _XOPEN_SOURCE
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -30,6 +40,8 @@
 #include <dlfcn.h>
 #include <assert.h>
 #include <poll.h>
+#include <threads.h>
+#include <sys/eventfd.h>
 #include <sys/param.h>
 #include <sys/uio.h>
 #include <sys/time.h>
@@ -104,8 +116,21 @@ struct node_slab {
 	int used;
 };
 
+struct fuse_vduse_dev {
+	VduseDev *dev;
+	pthread_t dev_thread;
+	struct fuse_cb_virtq_elem *cur_elem;
+	size_t num_queues, num_enabled_queues;
+
+	/* Auxiliary bufvec to use in the io read and write functions. They're
+	 * invalid at function exit */
+	struct fuse_bufvec *dst, *src;
+	size_t dst_size, src_size;
+};
+
 struct fuse {
 	struct fuse_session *se;
+	struct fuse_vduse_dev vdpa;
 	struct node_table name_table;
 	struct node_table id_table;
 	struct list_head lru_table;
@@ -198,6 +223,11 @@ static pthread_key_t fuse_context_key;
 static pthread_mutex_t fuse_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static int fuse_context_ref;
 static struct fuse_module *fuse_modules = NULL;
+
+static struct virtio_fs_config fs_config = {
+        .tag = "a",
+        .num_request_queues = 1,
+};
 
 static int fuse_register_module(const char *name,
 				fuse_module_factory_t factory,
@@ -4525,13 +4555,13 @@ static int fuse_session_loop_remember(struct fuse *f)
 	struct timespec now;
 	time_t next_clean;
 	struct pollfd fds = {
-		.fd = se->fd,
 		.events = POLLIN
 	};
 	struct fuse_buf fbuf = {
 		.mem = NULL,
 	};
 
+	assert(!"session_loop_remember not supported");
 	curr_time(&now);
 	next_clean = now.tv_sec;
 	while (!fuse_session_exited(se)) {
@@ -4581,6 +4611,8 @@ int fuse_loop(struct fuse *f)
 	return fuse_session_loop(f->se);
 }
 
+static int fuse_start_vduse_thread(struct fuse_vduse_dev *vdev);
+
 FUSE_SYMVER("fuse_loop_mt_312", "fuse_loop_mt@@FUSE_3.12")
 int fuse_loop_mt_312(struct fuse *f, struct fuse_loop_config *config)
 {
@@ -4590,6 +4622,9 @@ int fuse_loop_mt_312(struct fuse *f, struct fuse_loop_config *config)
 	int res = fuse_start_cleanup_thread(f);
 	if (res)
 		return -1;
+
+	res = fuse_start_vduse_thread(&f->vdpa);
+	assert(res == 0);
 
 	res = fuse_session_loop_mt_312(fuse_get_session(f), config);
 	fuse_stop_cleanup_thread(f);
@@ -4775,7 +4810,7 @@ void fuse_lib_help(struct fuse_args *args)
 			   fuse_lib_opt_proc) == -1
 	    || !conf.modules)
 		return;
-	
+
 	char *module;
 	char *next;
 	struct fuse_module *m;
@@ -4793,7 +4828,7 @@ void fuse_lib_help(struct fuse_args *args)
 	}
 }
 
-				      
+
 
 static int fuse_init_intr_signal(int signum, int *installed)
 {
@@ -4915,6 +4950,371 @@ void fuse_stop_cleanup_thread(struct fuse *f)
 	}
 }
 
+static void *fuse_vduse_handle_dev(void *opaque) {
+	struct fuse_vduse_dev *vdev = opaque;
+
+	while (true) {
+		int r = vduse_dev_handler(vdev->dev);
+		fprintf(stderr, "[DEBUG read r=%d][errno=%d]\n", r, errno);
+		assert(r == 0);
+	}
+}
+
+
+static int fuse_start_vduse_thread(struct fuse_vduse_dev *vdev) {
+	return fuse_start_thread(&vdev->dev_thread, fuse_vduse_handle_dev, vdev);
+}
+
+/* Copied from kernel doc vduse */
+static int netlink_add_vduse(const char *name, enum vdpa_command cmd)
+{
+        struct nl_sock *nlsock;
+        struct nl_msg *msg;
+        int famid;
+
+        nlsock = nl_socket_alloc();
+        if (!nlsock)
+                return -ENOMEM;
+
+        if (genl_connect(nlsock))
+                goto free_sock;
+
+        famid = genl_ctrl_resolve(nlsock, VDPA_GENL_NAME);
+        if (famid < 0)
+                goto close_sock;
+
+        msg = nlmsg_alloc();
+        if (!msg)
+                goto close_sock;
+
+        if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, famid, 0, 0, cmd, 0))
+                goto nla_put_failure;
+
+        NLA_PUT_STRING(msg, VDPA_ATTR_DEV_NAME, name);
+        if (cmd == VDPA_CMD_DEV_NEW)
+                NLA_PUT_STRING(msg, VDPA_ATTR_MGMTDEV_DEV_NAME, "vduse");
+
+        if (nl_send_sync(nlsock, msg))
+                goto close_sock;
+
+        nl_close(nlsock);
+        nl_socket_free(nlsock);
+
+        return 0;
+nla_put_failure:
+        nlmsg_free(msg);
+close_sock:
+        nl_close(nlsock);
+free_sock:
+        nl_socket_free(nlsock);
+        return -1;
+}
+
+struct fuse_cb_virtq_elem {
+	VduseVirtqElement elem;
+	VduseVirtq *vq;
+};
+
+static struct fuse_bufvec *realloc_bufvec(struct fuse_bufvec *bufv,
+					  size_t *cur_num_bufs,
+					  size_t num_bufs) {
+	struct fuse_bufvec *ret;
+	size_t bufs_size, new_size;
+	bool overflow;
+
+	assert(num_bufs > 0);
+	if (bufv && (*cur_num_bufs) >= num_bufs) {
+		ret = bufv;
+		goto out;
+	}
+
+	overflow = __builtin_mul_overflow(num_bufs, sizeof(bufv->buf[0]),
+	                                  &bufs_size);
+	assert(!overflow);
+
+	overflow = __builtin_add_overflow(offsetof(typeof(*bufv), buf),
+					  bufs_size, &new_size);
+	assert(!overflow);
+
+	ret = realloc(bufv, new_size);
+	assert(ret);
+
+	*cur_num_bufs = num_bufs;
+
+out:
+	ret->count = num_bufs;
+	ret->idx = 0;
+	ret->off = 0;
+	return ret;
+}
+
+static ssize_t vdpa_read_int(void *buf, size_t buf_len, struct fuse *fuse,
+                             int stop_fd, bool poll_only_device)
+{
+	static int revents = POLLIN | POLLPRI;
+	struct fuse_vduse_dev *vdev = &fuse->vdpa;
+	const struct fuse_in_header *in;
+	int vduse_fd = vduse_dev_get_fd(vdev->dev);
+	ssize_t written;
+
+	fprintf(stderr, "[eperezma %s:%d] A\n", __func__, __LINE__);
+	do {
+		static int infinite_timeout = -1;
+		/* TODO adapt to more queues */
+		struct pollfd pollfds[4] = {
+			{
+				/* First fd is device, always valid. */
+				.fd = vduse_fd,
+				.events = revents,
+			}, {
+				/* Second fd is the stop eventfd, sometimes
+				 * -1. The rest are vqs.
+				 */
+				.fd = stop_fd,
+				.events = revents,
+			},
+		};
+		nfds_t nfds = 2;
+		int r;
+		VduseVirtq *vqs[4];
+
+		/* It is important to fill the data in every iteration, as
+		 * vduse may change the number of queues */
+		for (size_t i = 0; !poll_only_device && i < vdev->num_queues; ++i) {
+			VduseVirtq *vq = vduse_dev_get_queue(vdev->dev, i);
+			int q_fd = poll_only_device ? -1 : vduse_queue_get_fd(vq);
+
+			fprintf(stderr, "[eperezma %s:%d][poll_only_device=%d][i=%zu][q_fd=%d]\n", __func__, __LINE__, poll_only_device, i, q_fd);
+			pollfds[nfds].fd = q_fd;
+			pollfds[nfds].events = revents;
+			vqs[nfds] = vq;
+			nfds++;
+		}
+
+		/* TODO: Avoid so many calls to poll! Store all descs in a list
+		 * and iterate before poll
+		 */
+		fprintf(stderr, "[eperezma %s:%d][nfds=%ld][fd0=%d][fd1=%d][fd2=%d][fd3=%d]\n", __func__, __LINE__, nfds, pollfds[0].fd, pollfds[1].fd, pollfds[2].fd, pollfds[3].fd);
+		r = poll(pollfds, nfds, infinite_timeout);
+#if DEBUG
+                fprintf(stderr, "[DEBUG poll r=%d][errno=%d]\n", r, errno);
+#endif
+
+		/* TODO: Include exit signal */
+		assert(r > 0);
+		if (pollfds[0].revents) {
+			if (pollfds[0].revents & POLLERR) {
+				int error = 0;
+
+				getsockopt(pollfds[0].fd, SOL_SOCKET, SO_ERROR, (void *)&error, (socklen_t []){sizeof(error)});
+				fprintf(stderr, "[eperezma %s:%d][POLLERR error=%d]\n", __func__, __LINE__, error);
+				assert(!"Returned pollerr");
+			}
+			if (pollfds[0].revents & POLLHUP) {
+				fprintf(stderr, "[POLLHUP]\n");
+			}
+			assert(!(pollfds[0].revents & POLLNVAL));
+			r = vduse_dev_handler(vdev->dev);
+			// We know for sure vq fd is eventfd
+// #if DEBUG
+			fprintf(stderr, "[DEBUG read r=%d][errno=%d]\n", r, errno);
+//#endif
+			if (r == -1 && errno == EAGAIN) {
+				continue;
+			}
+			assert(r == 0);
+			if (poll_only_device &&
+			    vdev->num_enabled_queues == vdev->num_queues) {
+				 fprintf(stderr, "[eperezma %s:%d][num_queues=%zu][enabled_queues=%zu] Breaking\n", __func__, __LINE__, vdev->num_queues, vdev->num_enabled_queues);
+				return 0;
+			}
+			continue;
+		}
+
+		if (pollfds[1].revents) {
+			assert(!(pollfds[0].revents & POLLERR));
+			if (pollfds[0].revents & POLLHUP) {
+				fprintf(stderr, "[POLLHUP]\n");
+			}
+			assert(!(pollfds[0].revents & POLLNVAL));
+			return 0;
+		}
+
+		for (nfds_t i = 2; i < nfds; ++i) {
+			uint64_t read_val;
+			if (!(pollfds[i].revents & revents)) {
+				continue;
+			}
+
+			assert(!vdev->cur_elem);
+			vdev->cur_elem = vduse_queue_pop(vqs[i], sizeof(*vdev->cur_elem));
+			if (vdev->cur_elem) {
+				vdev->cur_elem->vq = vqs[i];
+				break;
+			} else {
+				/* Remove poll */
+				r = read(pollfds[i].fd, &read_val, sizeof(read_val));
+				assert(r == 8);
+			}
+		}
+        } while (!vdev->cur_elem);
+
+	vdev->dst = realloc_bufvec(vdev->dst, &vdev->dst_size, 1);
+	vdev->dst->buf[0].mem = buf;
+	vdev->dst->buf[0].size = buf_len;
+	vdev->src = realloc_bufvec(vdev->src, &vdev->src_size,
+				   vdev->cur_elem->elem.out_num);
+	for (unsigned int i = 0; i < vdev->cur_elem->elem.out_num; i++) {
+		vdev->src->buf[i].size = vdev->cur_elem->elem.out_sg[i].iov_len;
+		vdev->src->buf[i].mem = vdev->cur_elem->elem.out_sg[i].iov_base;
+	}
+
+	written = fuse_buf_copy(vdev->dst, vdev->src, /*no flags */ 0);
+
+	in = buf;
+// #if DEBUG
+        fprintf(stderr, "[DEBUG %s:%d][vq=%p][POP elem=%p][in->opcode=%u]\n", __func__, __LINE__, vdev->cur_elem->vq, vdev->cur_elem, in->opcode);
+// #endif
+	if (in->opcode == FUSE_FORGET
+	    /* || in->opcode == FUSE_BATCH_FORGET */) {
+		/* This opcode does not return data to the driver so
+		 * push fn is never called.  Since we cannot return
+		 * error to the driver either as in_num == 0, push the
+		 * buffer here */
+		vduse_queue_push(vdev->cur_elem->vq,
+				&vdev->cur_elem->elem, 0);
+		vduse_queue_notify(vdev->cur_elem->vq);
+		fprintf(stderr,
+			"[DEBUG %s:%d][vq=%p][PUSH elem=%p][unique=%lu]\n",
+			__func__, __LINE__, vdev->cur_elem->vq, vdev->cur_elem,
+			in->unique);
+
+		free(vdev->cur_elem);
+		vdev->cur_elem = NULL;
+	}
+
+	return written;
+}
+
+/* Poll the device until stop_fd signals to stop */
+void fuse_poll_vqs(struct fuse *f, int stop_fd)
+{
+	fprintf(stderr, "[eperezma %s:%d][stop_fd=%d]\n", __func__, __LINE__, stop_fd);
+	vdpa_read_int(NULL, 0, f, stop_fd, false);
+	fprintf(stderr, "[eperezma %s:%d][stop_fd=%d][finishing, waiting for mount thread]\n", __func__, __LINE__, stop_fd);
+}
+
+void fuse_poll_device(struct fuse *f)
+{
+	fprintf(stderr, "[eperezma %s:%d]\n", __func__, __LINE__);
+	vdpa_read_int(NULL, 0, f, -1, true);
+}
+
+static ssize_t vdpa_read(int fd, void *buf, size_t buf_len, void *userdata) {
+        struct fuse *fuse = userdata;
+        (void)fd;
+
+	return vdpa_read_int(buf, buf_len, fuse, -1, false);
+}
+
+static ssize_t vdpa_writev(int fd, struct iovec *iov, int count,
+		           void *userdata) {
+        const struct fuse_out_header *out = iov[0].iov_base;
+        struct fuse *fuse = userdata;
+        struct fuse_vduse_dev *vdev = &fuse->vdpa;
+        size_t written;
+
+        (void)fd;
+        assert(iov[0].iov_len >= sizeof(*out));
+
+        assert(vdev->cur_elem);
+
+	vdev->dst = realloc_bufvec(vdev->dst, &vdev->dst_size,
+				   vdev->cur_elem->elem.in_num);
+	for (unsigned int i = 0; i < vdev->cur_elem->elem.in_num; ++i) {
+		vdev->dst->buf[i].size = vdev->cur_elem->elem.in_sg[i].iov_len;
+		vdev->dst->buf[i].mem = vdev->cur_elem->elem.in_sg[i].iov_base;
+	}
+
+	vdev->src = realloc_bufvec(vdev->src, &vdev->src_size, count);
+	for (unsigned int i = 0; i < count; ++i) {
+		vdev->src->buf[i].size = iov[i].iov_len;
+		vdev->src->buf[i].mem = iov[i].iov_base;
+	}
+
+	written = fuse_buf_copy(vdev->dst, vdev->src, /*no flags */ 0);
+        vduse_queue_push(vdev->cur_elem->vq, &vdev->cur_elem->elem, written);
+        vduse_queue_notify(vdev->cur_elem->vq);
+        fprintf(stderr, "[DEBUG %s:%d][vq=%p][PUSH elem=%p written=%zu][len=%u][error=%d][unique=%lu]\n", __func__, __LINE__, vdev->cur_elem->vq, vdev->cur_elem, written, out->len, out->error, out->unique);
+
+        free(vdev->cur_elem);
+        vdev->cur_elem = NULL;
+        return written;
+}
+
+static void vduse_dev_enable_queue(VduseDev *dev, VduseVirtq *vq)
+{
+	(void)vq;
+
+	struct fuse *f = vduse_dev_get_priv(dev);
+	f->vdpa.num_enabled_queues++;
+}
+
+static void vduse_dev_disable_queue(VduseDev *dev, VduseVirtq *vq)
+{
+	(void)vq;
+
+	struct fuse *f = vduse_dev_get_priv(dev);
+	f->vdpa.num_enabled_queues--;
+}
+
+static const VduseOps vduse_ops = {
+        /* Called when virtqueue can be processed */
+        .enable_queue = vduse_dev_enable_queue,
+        /* Called when virtqueue processing should be stopped */
+        .disable_queue = vduse_dev_disable_queue,
+};
+
+static VduseDev *create_vdpa(struct fuse *priv) {
+        static const char *vduse_name = "fsd";
+        size_t q_size = 1024;
+        uint32_t device_id = VIRTIO_ID_FS;
+        uint32_t vendor_id = /* #define PCI_VENDOR_ID_REDHAT */ 0x1b36;
+        uint64_t features = 1ULL << VIRTIO_F_VERSION_1
+                        | 1ULL << VIRTIO_RING_F_INDIRECT_DESC
+                        /* | 1ULL << VIRTIO_RING_F_EVENT_IDX */
+                        | 1ULL << 33 /* VIRTIO_F_ACCESS_PLATFORM */;
+        uint16_t num_queues = 2;
+        uint32_t config_size = sizeof(fs_config);
+        static VduseDev *vduse_dev;
+        char *config = (void *)&fs_config;
+        int r;
+
+        vduse_dev = vduse_dev_create(vduse_name, device_id, vendor_id,
+                                     features, num_queues, config_size, config,
+                                     &vduse_ops, priv);
+        assert(vduse_dev);
+
+        // TODO: make this configurable.
+        r = vduse_set_reconnect_log_file(vduse_dev, "/tmp/vduse_reconnect.log");
+        assert(r == 0);
+        r = unlink("/tmp/vduse_reconnect.log");
+
+        for (int i = 0; i < num_queues; ++i) {
+                r = vduse_dev_setup_queue(vduse_dev, i, q_size);
+                assert(r == 0);
+        }
+
+	fuse_log(FUSE_LOG_INFO, "fuse: creating vdpa with netlink, this may take some seconds\n");
+
+	/* TODO: It takes some seconds if virtio_vdpa is loaded? Or am I confusing it with poll time? */
+	r = netlink_add_vduse("fsd", VDPA_CMD_DEV_NEW);
+	assert (r == 0);
+
+	priv->vdpa.num_queues = num_queues;
+        return vduse_dev;
+}
+
 /*
  * Not supposed to be called directly, but supposed to be called
  * through the fuse_new macro
@@ -4929,10 +5329,16 @@ struct fuse *_fuse_new_317(struct fuse_args *args,
 			   size_t op_size, struct libfuse_version *version,
 			   void *user_data)
 {
+	static const struct fuse_custom_io vdpa_io = {
+		.writev = vdpa_writev,
+		.read = vdpa_read,
+	};
+
 	struct fuse *f;
 	struct node *root;
 	struct fuse_fs *fs;
 	struct fuse_lowlevel_ops llop = fuse_path_ops;
+	int r;
 
 	f = (struct fuse *) calloc(1, sizeof(struct fuse));
 	if (f == NULL) {
@@ -5009,9 +5415,21 @@ struct fuse *_fuse_new_317(struct fuse_args *args,
 	f->conf.readdir_ino = 1;
 #endif
 
+	r = system("lsmod|grep -q virtio_vdpa");
+	assert(WIFEXITED(r));
+	if (WEXITSTATUS(r) == 0) {
+		assert(!"Please unload virtio_vdpa before calling this, load them when indicated");
+	}
+
+	f->vdpa.dev = create_vdpa(f);
+
 	f->se = _fuse_session_new(args, &llop, sizeof(llop), version, f);
 	if (f->se == NULL)
 		goto out_free_fs;
+
+	r = fuse_session_custom_io(f->se, &vdpa_io, sizeof(vdpa_io),
+			/* Unused? */ vduse_dev_get_fd(f->vdpa.dev));
+	assert(r == 0);
 
 	if (f->conf.debug) {
 		fuse_log(FUSE_LOG_DEBUG, "nullpath_ok: %i\n", f->conf.nullpath_ok);

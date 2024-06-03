@@ -16,6 +16,7 @@
 #include <sys/param.h>
 #include "fuse_mount_compat.h"
 
+#include <assert.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/sysctl.h>
@@ -217,11 +218,11 @@ mount:
 		if (pid == 0) {
 			const char *argv[32];
 			int a = 0;
-			int ret = -1; 
-			
+			int ret = -1;
+
 			if (! fdnam)
 			{
-				ret = asprintf(&fdnam, "%d", fd); 
+				ret = asprintf(&fdnam, "%d", fd);
 				if(ret == -1)
 				{
 					perror("fuse: failed to assemble mount arguments");
@@ -286,6 +287,7 @@ void destroy_mount_opts(struct mount_opts *mo)
 
 int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo)
 {
+	assert(!"BSD mount not supported");
 	/* mount util should not try to spawn the daemon */
 	setenv("MOUNT_FUSEFS_SAFE", "1", 1);
 	/* to notify the mount util it's called from lib */

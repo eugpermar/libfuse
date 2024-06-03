@@ -19,7 +19,7 @@ threaded_examples = [ 'notify_inval_inode',
                       'poll' ]
 
 foreach ex : examples
-    executable(ex, ex + '.c',
+    executable(ex, [ex + '.c', '../lib/libvduse.c'],
                dependencies: [ libfuse_dep ],
                install: false)
 endforeach
@@ -27,6 +27,7 @@ endforeach
 
 foreach ex : threaded_examples
     executable(ex, ex + '.c',
+               c_args: ['-Wno-unused-parameter'],
                dependencies: [ thread_dep, libfuse_dep ],
                install: false)
 endforeach

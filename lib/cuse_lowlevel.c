@@ -13,6 +13,7 @@
 #include "fuse_i.h"
 #include "fuse_opt.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -309,7 +310,7 @@ struct fuse_session *cuse_lowlevel_setup(int argc, char *argv[],
 				devname, strerror(errno));
 		goto err_se;
 	}
-	se->fd = fd;
+	// se->fd = fd;
 
 	res = fuse_set_signal_handlers(se);
 	if (res == -1)
@@ -345,6 +346,7 @@ int cuse_lowlevel_main(int argc, char *argv[], const struct cuse_info *ci,
 	int multithreaded;
 	int res;
 
+	assert(!"cuse_lowlevel_main not supported");
 	se = cuse_lowlevel_setup(argc, argv, ci, clop, &multithreaded,
 				 userdata);
 	if (se == NULL)

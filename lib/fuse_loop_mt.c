@@ -31,7 +31,7 @@
 
 #define FUSE_LOOP_MT_V2_IDENTIFIER	 INT_MAX - 2
 #define FUSE_LOOP_MT_DEF_CLONE_FD	 0
-#define FUSE_LOOP_MT_DEF_MAX_THREADS 10
+#define FUSE_LOOP_MT_DEF_MAX_THREADS 1
 #define FUSE_LOOP_MT_DEF_IDLE_THREADS -1 /* thread destruction is disabled
                                           * by default */
 
@@ -242,37 +242,6 @@ int fuse_start_thread(pthread_t *thread_id, void *(*func)(void *), void *arg)
 	return 0;
 }
 
-static int fuse_clone_chan_fd_default(struct fuse_session *se)
-{
-	int res;
-	int clonefd;
-	uint32_t masterfd;
-	const char *devname = "/dev/fuse";
-
-#ifndef O_CLOEXEC
-#define O_CLOEXEC 0
-#endif
-	clonefd = open(devname, O_RDWR | O_CLOEXEC);
-	if (clonefd == -1) {
-		fuse_log(FUSE_LOG_ERR, "fuse: failed to open %s: %s\n", devname,
-			strerror(errno));
-		return -1;
-	}
-#ifndef O_CLOEXEC
-	fcntl(clonefd, F_SETFD, FD_CLOEXEC);
-#endif
-
-	masterfd = se->fd;
-	res = ioctl(clonefd, FUSE_DEV_IOC_CLONE, &masterfd);
-	if (res == -1) {
-		fuse_log(FUSE_LOG_ERR, "fuse: failed to clone device fd: %s\n",
-			strerror(errno));
-		close(clonefd);
-		return -1;
-	}
-	return clonefd;
-}
-
 static struct fuse_chan *fuse_clone_chan(struct fuse_mt *mt)
 {
 	int clonefd;
@@ -281,11 +250,11 @@ static struct fuse_chan *fuse_clone_chan(struct fuse_mt *mt)
 
 	if (se->io != NULL) {
 		if (se->io->clone_fd != NULL)
-			clonefd = se->io->clone_fd(se->fd);
+			clonefd = se->io->clone_fd(0);
 		else
 			return NULL;
 	} else {
-		clonefd = fuse_clone_chan_fd_default(se);
+		assert(!"Need to provide se->io && se->io->clone_fd");
 	}
 	if (clonefd < 0)
 		return NULL;

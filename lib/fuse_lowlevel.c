@@ -197,10 +197,10 @@ static int fuse_send_msg(struct fuse_session *se, struct fuse_chan *ch,
 	if (se->io != NULL)
 		/* se->io->writev is never NULL if se->io is not NULL as
 		specified by fuse_session_custom_io()*/
-		res = se->io->writev(ch ? ch->fd : se->fd, iov, count,
+		res = se->io->writev(ch ? ch->fd : 0, iov, count,
 					   se->userdata);
 	else
-		res = writev(ch ? ch->fd : se->fd, iov, count);
+		res = writev(ch ? ch->fd : 0, iov, count);
 
 	int err = errno;
 
@@ -479,27 +479,23 @@ int fuse_reply_readlink(fuse_req_t req, const char *linkname)
 
 int fuse_passthrough_open(fuse_req_t req, int fd)
 {
-	struct fuse_backing_map map = { .fd = fd };
-	int ret;
+	(void) req;
+	(void) fd;
 
-	ret = ioctl(req->se->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
-	if (ret <= 0) {
-		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_open: %s\n", strerror(errno));
-		return 0;
-	}
-
-	return ret;
+	errno = EINVAL;
+	fuse_log(FUSE_LOG_ERR, "fuse: passthrough_open: %s\n", strerror(errno));
+	return 0;
 }
 
 int fuse_passthrough_close(fuse_req_t req, int backing_id)
 {
-	int ret;
+	(void) req;
+	(void) backing_id;
 
-	ret = ioctl(req->se->fd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id);
-	if (ret < 0)
-		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_close: %s\n", strerror(errno));
+	errno = EINVAL;
+	fuse_log(FUSE_LOG_ERR, "fuse: passthrough_close: %s\n", strerror(errno));
 
-	return ret;
+	return -1;
 }
 
 int fuse_reply_open(fuse_req_t req, const struct fuse_file_info *f)
@@ -869,10 +865,10 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 
 	if (se->io != NULL && se->io->splice_send != NULL) {
 		res = se->io->splice_send(llp->pipe[0], NULL,
-						  ch ? ch->fd : se->fd, NULL, out->len,
+						  ch ? ch->fd : 0, NULL, out->len,
 					  	  splice_flags, se->userdata);
 	} else {
-		res = splice(llp->pipe[0], NULL, ch ? ch->fd : se->fd, NULL,
+		res = splice(llp->pipe[0], NULL, ch ? ch->fd : 0, NULL,
 			       out->len, splice_flags);
 	}
 	if (res == -1) {
@@ -2892,8 +2888,6 @@ void fuse_session_destroy(struct fuse_session *se)
 	pthread_key_delete(se->pipe_key);
 	pthread_mutex_destroy(&se->lock);
 	free(se->cuse_data);
-	if (se->fd != -1)
-		close(se->fd);
 	if (se->io != NULL)
 		free(se->io);
 	destroy_mount_opts(se->mo);
@@ -2946,11 +2940,11 @@ int fuse_session_receive_buf_int(struct fuse_session *se, struct fuse_buf *buf,
 	}
 
 	if (se->io != NULL && se->io->splice_receive != NULL) {
-		res = se->io->splice_receive(ch ? ch->fd : se->fd, NULL,
+		res = se->io->splice_receive(ch ? ch->fd : 0, NULL,
 						     llp->pipe[1], NULL, bufsize, 0,
 						     se->userdata);
 	} else {
-		res = splice(ch ? ch->fd : se->fd, NULL, llp->pipe[1], NULL,
+		res = splice(ch ? ch->fd : 0, NULL, llp->pipe[1], NULL,
 				 bufsize, 0);
 	}
 	err = errno;
@@ -3041,10 +3035,10 @@ restart:
 	if (se->io != NULL) {
 		/* se->io->read is never NULL if se->io is not NULL as
 		specified by fuse_session_custom_io()*/
-		res = se->io->read(ch ? ch->fd : se->fd, buf->mem, se->bufsize,
+		res = se->io->read(ch ? ch->fd : 0, buf->mem, se->bufsize,
 					 se->userdata);
 	} else {
-		res = read(ch ? ch->fd : se->fd, buf->mem, se->bufsize);
+		res = read(ch ? ch->fd : 0, buf->mem, se->bufsize);
 	}
 	err = errno;
 
@@ -3105,7 +3099,6 @@ struct fuse_session *_fuse_session_new_317(struct fuse_args *args,
 		fuse_log(FUSE_LOG_ERR, "fuse: failed to allocate fuse object\n");
 		goto out1;
 	}
-	se->fd = -1;
 	se->conn.max_write = UINT_MAX;
 	se->conn.max_readahead = UINT_MAX;
 
@@ -3206,16 +3199,13 @@ FUSE_SYMVER("fuse_session_custom_io_317", "fuse_session_custom_io@@FUSE_3.17")
 int fuse_session_custom_io_317(struct fuse_session *se,
 				const struct fuse_custom_io *io, size_t op_size, int fd)
 {
+	(void) fd;
+
 	if (sizeof(struct fuse_custom_io) < op_size) {
 		fuse_log(FUSE_LOG_ERR, "fuse: warning: library too old, some operations may not work\n");
 		op_size = sizeof(struct fuse_custom_io);
 	}
 
-	if (fd < 0) {
-		fuse_log(FUSE_LOG_ERR, "Invalid file descriptor value %d passed to "
-			"fuse_session_custom_io()\n", fd);
-		return -EBADF;
-	}
 	if (io == NULL) {
 		fuse_log(FUSE_LOG_ERR, "No custom IO passed to "
 			"fuse_session_custom_io()\n");
@@ -3237,7 +3227,6 @@ int fuse_session_custom_io_317(struct fuse_session *se,
 		return -errno;
 	}
 
-	se->fd = fd;
 	memcpy(se->io, io, op_size);
 	return 0;
 }
@@ -3255,6 +3244,7 @@ int fuse_session_custom_io_30(struct fuse_session *se,
 int fuse_session_mount(struct fuse_session *se, const char *mountpoint)
 {
 	int fd;
+	int ret;
 
 	if (mountpoint == NULL) {
 		fuse_log(FUSE_LOG_ERR, "Invalid null-ptr mountpoint!\n");
@@ -3279,21 +3269,20 @@ int fuse_session_mount(struct fuse_session *se, const char *mountpoint)
 	 */
 	fd = fuse_mnt_parse_fuse_fd(mountpoint);
 	if (fd != -1) {
+		assert(!"Starting from vduse / fuse fd not supported");
 		if (fcntl(fd, F_GETFD) == -1) {
 			fuse_log(FUSE_LOG_ERR,
 				"fuse: Invalid file descriptor /dev/fd/%u\n",
 				fd);
 			return -1;
 		}
-		se->fd = fd;
 		return 0;
 	}
 
 	/* Open channel */
-	fd = fuse_kern_mount(mountpoint, se->mo);
-	if (fd == -1)
+	ret = fuse_kern_mount(mountpoint, se->mo);
+	if (ret != 0)
 		return -1;
-	se->fd = fd;
 
 	/* Save mountpoint */
 	se->mountpoint = strdup(mountpoint);
@@ -3309,14 +3298,14 @@ error_out:
 
 int fuse_session_fd(struct fuse_session *se)
 {
-	return se->fd;
+	(void)se;
+	return -1;
 }
 
 void fuse_session_unmount(struct fuse_session *se)
 {
 	if (se->mountpoint != NULL) {
-		fuse_kern_unmount(se->mountpoint, se->fd);
-		se->fd = -1;
+		fuse_kern_unmount(se->mountpoint, -1);
 		free(se->mountpoint);
 		se->mountpoint = NULL;
 	}

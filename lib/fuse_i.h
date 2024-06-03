@@ -44,7 +44,8 @@ struct fuse_notify_req {
 struct fuse_session {
 	char *mountpoint;
 	volatile int exited;
-	int fd;
+	// TODO replace by vdpa_dev?
+	// int fd;
 	struct fuse_custom_io *io;
 	struct mount_opts *mo;
 	int debug;
@@ -195,6 +196,8 @@ int fuse_session_loop_mt_312(struct fuse_session *se, struct fuse_loop_config *c
  */
 int fuse_loop_cfg_verify(struct fuse_loop_config *config);
 
+void fuse_poll_vqs(struct fuse *f, int stop_fd);
+void fuse_poll_device(struct fuse *f);
 
 #define FUSE_MAX_MAX_PAGES 256
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32

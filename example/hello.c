@@ -128,12 +128,30 @@ static int hello_read(const char *path, char *buf, size_t size, off_t offset,
 	return size;
 }
 
+static int hello_getxattr(const char *path, const char *name, char *value,
+                                                          size_t size)
+{
+        (void)size;
+	fprintf(stderr, "[eperezma %s:%d][path=%s]\n", __func__, __LINE__, path);
+        if (strcmp(name, "hello_getxattr_name") == 0)
+        {
+                const char *buf = "hello_getxattr_value";
+                strncpy(value, buf, size);
+		return 0;
+        }
+        else
+        {
+                return -1;
+        }
+}
+
 static const struct fuse_operations hello_oper = {
 	.init           = hello_init,
 	.getattr	= hello_getattr,
 	.readdir	= hello_readdir,
 	.open		= hello_open,
 	.read		= hello_read,
+	.getxattr       = hello_getxattr,
 };
 
 static void show_help(const char *progname)

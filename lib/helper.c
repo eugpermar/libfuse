@@ -17,6 +17,7 @@
 #include "fuse_lowlevel.h"
 #include "mount_util.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -25,6 +26,7 @@
 #include <limits.h>
 #include <errno.h>
 #include <sys/param.h>
+#include <sys/eventfd.h>
 
 #define FUSE_HELPER_OPT(t, p) \
 	{ t, offsetof(struct fuse_cmdline_opts, p), 1 }
@@ -304,12 +306,35 @@ int fuse_daemonize(int foreground)
 	return 0;
 }
 
+struct fuse_mount_args {
+       struct fuse *fuse;
+       const char *mountpoint;
+       int stop_fd;
+};
+
+#if 0
+static void *fuse_main_mount_thread(void *arg)
+{
+       struct fuse_mount_args *args = arg;
+       int write_r;
+       int r = fuse_mount(args->fuse, args->mountpoint);
+
+       write_r = eventfd_write(args->stop_fd, 1);
+       assert(write_r == 0);
+       return (void *)(intptr_t)r;
+}
+#endif
+
 int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 		   size_t op_size, struct libfuse_version *version, void *user_data);
 FUSE_SYMVER("fuse_main_real_317", "fuse_main_real@@FUSE_3.17")
 int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 		   size_t op_size, struct libfuse_version *version, void *user_data)
 {
+        struct fuse_mount_args mount_args = {};
+        // pthread_t mount_thread;
+	// void *mount_thread_res;
+
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	struct fuse *fuse;
 	struct fuse_cmdline_opts opts;
@@ -349,12 +374,41 @@ int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 		res = 3;
 		goto out1;
 	}
+	fuse_log(FUSE_LOG_NOTICE,
+		 "fuse: waiting for the virtio driver contact vduse dev\n");
+	fuse_poll_device(fuse);
 
-	if (fuse_mount(fuse,opts.mountpoint) != 0) {
+	fuse_log(FUSE_LOG_NOTICE, "fuse: mounting device\n");
+	/* As vDPA device needs to answer the mount call, let's move it to
+	 * another thread.
+	 */
+	mount_args = (typeof(mount_args)) {
+		.fuse = fuse,
+		.mountpoint = opts.mountpoint,
+		.stop_fd = eventfd(0, 0),
+	};
+	assert(mount_args.stop_fd > 0);
+#if 0
+	res = pthread_create(&mount_thread, NULL, fuse_main_mount_thread,
+			&mount_args);
+	fprintf(stderr, "[eperezma %s:%d] Please mount -t virtiofs a %s\n", __func__, __LINE__, opts.mountpoint);
+	fprintf(stderr, "[eperezma %s:%d] Waiting for mount(7)\n", __func__, __LINE__);
+	assert(res == 0);
+	fuse_poll_vqs(fuse, mount_args.stop_fd);
+	fprintf(stderr, "[eperezma %s:%d] Finished, waiting for mount(7) to join\n", __func__, __LINE__);
+
+	res = pthread_join(mount_thread, &mount_thread_res);
+	assert(res == 0);
+	if (mount_thread_res != 0) {
 		res = 4;
 		goto out2;
 	}
+#endif
 
+	close(mount_args.stop_fd);
+	if (!opts.foreground) {
+		assert(!"Daemon operation without -f not supported");
+	}
 	if (fuse_daemonize(opts.foreground) != 0) {
 		res = 5;
 		goto out3;
@@ -366,9 +420,10 @@ int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 		goto out3;
 	}
 
-	if (opts.singlethread)
+	if (opts.singlethread) {
+		assert(!"single thread not supported");
 		res = fuse_loop(fuse);
-	else {
+	} else {
 		loop_config = fuse_loop_cfg_create();
 		if (loop_config == NULL) {
 			res = 7;
@@ -387,7 +442,7 @@ int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 	fuse_remove_signal_handlers(se);
 out3:
 	fuse_unmount(fuse);
-out2:
+// out2:
 	fuse_destroy(fuse);
 out1:
 	fuse_loop_cfg_destroy(loop_config);
@@ -478,6 +533,7 @@ int fuse_open_channel(const char *mountpoint, const char* options)
 	int argc = sizeof(argv) / sizeof(argv[0]);
 	struct fuse_args args = FUSE_ARGS_INIT(argc, (char**) argv);
 
+	assert(!"Call to fuse_open_channel not supported");
 	opts = parse_mount_opts(&args);
 	if (opts == NULL)
 		return -1;
