@@ -27,20 +27,29 @@
 #define _GNU_SOURCE
 #endif
 
+#include "libvduse.h"
+#include "standard-headers/linux/virtio_fs.h"
+#include "standard-headers/linux/virtio_ring.h"
+
 #include <fuse_lowlevel.h>
 #include <fuse_kernel.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <poll.h>
+#include <threads.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <assert.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 
 static const char *hello_str = "Hello World!\n";
 static const char *hello_name = "hello";
+
+static struct fuse_session *ses[2];
+static struct fuse_args args;
+
+static thread_local VduseVirtqElement *cur_elem;
 
 static int hello_stat(fuse_ino_t ino, struct stat *stbuf)
 {
@@ -180,52 +189,10 @@ static const struct fuse_lowlevel_ops hello_ll_oper = {
 	.read		= hello_ll_read,
 };
 
-static int create_socket(const char *socket_path) {
-	struct sockaddr_un addr;
-
-	if (strnlen(socket_path, sizeof(addr.sun_path)) >=
-		sizeof(addr.sun_path)) {
-		printf("Socket path may not be longer than %lu characters\n",
-			 sizeof(addr.sun_path) - 1);
-		return -1;
-	}
-
-	if (remove(socket_path) == -1 && errno != ENOENT) {
-		printf("Could not delete previous socket file entry at %s. Error: "
-			 "%s\n", socket_path, strerror(errno));
-		return -1;
-	}
-
-	memset(&addr, 0, sizeof(struct sockaddr_un));
-	strcpy(addr.sun_path, socket_path);
-
-	int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sfd == -1) {
-		printf("Could not create socket. Error: %s\n", strerror(errno));
-		return -1;
-	}
-
-	addr.sun_family = AF_UNIX;
-	if (bind(sfd, (struct sockaddr *) &addr,
-		   sizeof(struct sockaddr_un)) == -1) {
-		printf("Could not bind socket. Error: %s\n", strerror(errno));
-		return -1;
-	}
-
-	if (listen(sfd, 1) == -1)
-		return -1;
-
-	printf("Awaiting connection on socket at %s...\n", socket_path);
-	int cfd = accept(sfd, NULL, NULL);
-	if (cfd == -1) {
-		printf("Could not accept connection. Error: %s\n",
-			 strerror(errno));
-		return -1;
-	} else {
-		printf("Accepted connection!\n");
-	}
-	return cfd;
-}
+static struct virtio_fs_config fs_config = {
+		.tag = "a",
+        .num_request_queues = 1,
+};
 
 static ssize_t stream_writev(int fd, struct iovec *iov, int count,
                              void *userdata) {
@@ -250,40 +217,51 @@ static ssize_t stream_writev(int fd, struct iovec *iov, int count,
 }
 
 
-static ssize_t readall(int fd, void *buf, size_t len) {
-	size_t count = 0;
+static int poll_one_forever(int fd) {
+	static const int timeout_inf = -1;
+	struct pollfd pollfd = {
+		.fd = fd,
+		.events = POLLIN | POLLPRI,
+	};
 
-	while (count < len) {
-		int i = read(fd, (char *)buf + count, len - count);
-		if (!i)
-			break;
+	return poll(&pollfd, 1, timeout_inf);
+}
 
-		if (i < 0)
-			return i;
+static ssize_t iov_to_buf(const struct iovec *iov, int iov_count, void *buf, size_t buf_len) {
+	ssize_t total_bytes_copied = 0;
+	char *buf_ptr = (char *)buf;
 
-		count += i;
+	for (int i = 0; i < iov_count; i++) {
+		size_t bytes_to_copy = iov[i].iov_len;
+		if (total_bytes_copied + bytes_to_copy > buf_len) {
+			return buf_len + 1;
+		}
+
+		memcpy(buf_ptr, iov[i].iov_base, bytes_to_copy);
+		total_bytes_copied += bytes_to_copy;
+		buf_ptr += bytes_to_copy;
 	}
-	return count;
+
+	return total_bytes_copied;
 }
 
 static ssize_t stream_read(int fd, void *buf, size_t buf_len, void *userdata) {
-    (void)userdata;
+	VduseVirtq *vq = userdata;
+	ssize_t s;
+	(void)fd;
 
-	int res = readall(fd, buf, sizeof(struct fuse_in_header));
-	if (res == -1)
-    	return res;
+	// TODO Do we need an extra fd to exit thread?
+	int r = poll_one_forever(vduse_queue_get_fd(vq));
+	assert(r == 1);
 
+	assert(!cur_elem);
+	cur_elem = vduse_queue_pop(vq, sizeof(*cur_elem));
+	assert(cur_elem);
 
-    uint32_t packet_len = ((struct fuse_in_header *)buf)->len;
-    if (packet_len > buf_len)
-    	return -1;
+	s = iov_to_buf(cur_elem->out_sg, cur_elem->out_num, buf, buf_len);
+	assert(s > 0 && s <= buf_len); // return -1
 
-    int prev_res = res;
-
-    res = readall(fd, (char *)buf + sizeof(struct fuse_in_header),
-                  packet_len - sizeof(struct fuse_in_header));
-
-    return  (res == -1) ? res : (res + prev_res);
+	return s;
 }
 
 static ssize_t stream_splice_send(int fdin, off_t *offin, int fdout,
@@ -302,6 +280,82 @@ static ssize_t stream_splice_send(int fdin, off_t *offin, int fdout,
 	return count;
 }
 
+static void vduse_dev_enable_queue(VduseDev *dev, VduseVirtq *vq)
+{
+    int idx = vduse_dev_get_queue(dev, 0) == vq ? 0 : 1;
+	struct fuse_session *se;
+	const struct fuse_custom_io io = {
+		.writev = stream_writev,
+		.read = stream_read,
+		.splice_receive = NULL,
+		.splice_send = stream_splice_send,
+	};
+	int cfd = vduse_queue_get_fd(vq);
+	int r;
+
+	se = fuse_session_new(&args, &hello_ll_oper,
+					sizeof(hello_ll_oper), vq);
+	assert(se);
+
+	r = fuse_set_signal_handlers(se);
+	assert(r == 0);
+
+	r = fuse_session_custom_io(se, &io, cfd);
+	assert(r == 0);
+
+	r = fuse_session_loop(se);
+	assert(r == 0);
+
+	ses[idx] = se;
+}
+
+static void vduse_dev_disable_queue(VduseDev *dev, VduseVirtq *vq)
+{
+    int idx = vduse_dev_get_queue(dev, 0) == vq ? 0 : 1;
+
+	fuse_remove_signal_handlers(ses[idx]);
+	fuse_session_destroy(ses[idx]);
+}
+
+static const VduseOps vduse_ops = {
+        /* Called when virtqueue can be processed */
+        .enable_queue = vduse_dev_enable_queue,
+        /* Called when virtqueue processing should be stopped */
+        .disable_queue = vduse_dev_disable_queue,
+};
+
+static VduseDev *create_vdpa(void) {
+	static const char *vduse_name = "fsd";
+	size_t q_size = 1024;
+	uint32_t device_id = VIRTIO_ID_FS;
+	uint32_t vendor_id = /* #define PCI_VENDOR_ID_REDHAT */ 0x1b36;
+	uint64_t features = 1ULL << VIRTIO_F_VERSION_1
+			| 1ULL << VIRTIO_RING_F_INDIRECT_DESC
+			/* | 1ULL << VIRTIO_RING_F_EVENT_IDX */
+			| 1ULL << 33 /* VIRTIO_F_ACCESS_PLATFORM */;
+	uint16_t num_queues = 2;
+	uint32_t config_size = sizeof(fs_config);
+	static VduseDev *vduse_dev;
+	char *config = (void *)&fs_config;
+	void *priv = NULL;
+	int r;
+
+	vduse_dev = vduse_dev_create(vduse_name, device_id, vendor_id,
+	                             features, num_queues, config_size, config,
+	                             &vduse_ops, priv);
+	assert(vduse_dev);
+
+	// TODO: make this configurable.
+	r = vduse_set_reconnect_log_file(vduse_dev, "/tmp/vduse_reconnect.log");
+
+	for (int i = 0; i < num_queues; ++i) {
+		r = vduse_dev_setup_queue(vduse_dev, i, q_size);
+		assert(r == 0);
+	}
+
+	return vduse_dev;
+}
+
 static void fuse_cmdline_help_uds(void)
 {
 	printf("    -h   --help            print help\n"
@@ -311,16 +365,9 @@ static void fuse_cmdline_help_uds(void)
 
 int main(int argc, char *argv[])
 {
-	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-	struct fuse_session *se;
+	args = (typeof(args))FUSE_ARGS_INIT(argc, argv);
 	struct fuse_cmdline_opts opts;
-	const struct fuse_custom_io io = {
-		.writev = stream_writev,
-		.read = stream_read,
-		.splice_receive = NULL,
-		.splice_send = stream_splice_send,
-	};
-	int cfd = -1;
+		VduseDev *vdev;
 	int ret = -1;
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
@@ -330,36 +377,34 @@ int main(int argc, char *argv[])
 		fuse_cmdline_help_uds();
 		fuse_lowlevel_help();
 		ret = 0;
-		goto err_out1;
+		goto err;
 	} else if (opts.show_version) {
 		printf("FUSE library version %s\n", fuse_pkgversion());
 		fuse_lowlevel_version();
 		ret = 0;
-		goto err_out1;
+		goto err;
 	}
 
-	se = fuse_session_new(&args, &hello_ll_oper,
-			      sizeof(hello_ll_oper), NULL);
-	if (se == NULL)
-	    goto err_out1;
+	vdev = create_vdpa();
+	if (!vdev)
+		goto err;
 
-	if (fuse_set_signal_handlers(se) != 0)
-	    goto err_out2;
 
-	cfd = create_socket("/tmp/libfuse-hello-ll.sock");
-	if (cfd == -1)
-		goto err_out3;
+	// Wait until vqs are initialized
+	while (1) {
+		ret = poll_one_forever(vduse_dev_get_fd(vdev));
+		assert(ret > 0);
 
-	if (fuse_session_custom_io(se, &io, cfd) != 0)
-		goto err_out3;
+		ret = vduse_dev_handler(vdev);
+		assert(ret == 0);
+	}
 
-	/* Block until ctrl+c */
-	ret = fuse_session_loop(se);
-err_out3:
-	fuse_remove_signal_handlers(se);
-err_out2:
-	fuse_session_destroy(se);
-err_out1:
+	ret = vduse_dev_destroy(vdev);
+	if (ret) {
+		fprintf(stderr, "Error destroying vduse: %d(%s)", -ret, strerror(-ret));
+	}
+
+err:
 	free(opts.mountpoint);
 	fuse_opt_free_args(&args);
 
