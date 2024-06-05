@@ -46,6 +46,7 @@
 static const char *hello_str = "Hello World!\n";
 static const char *hello_name = "hello";
 
+static thrd_t threads[2];
 static struct fuse_session *ses[2];
 static struct fuse_args args;
 
@@ -280,9 +281,10 @@ static ssize_t stream_splice_send(int fdin, off_t *offin, int fdout,
 	return count;
 }
 
-static void vduse_dev_enable_queue(VduseDev *dev, VduseVirtq *vq)
+static int fuse_poll_queue(void *arg)
 {
-    int idx = vduse_dev_get_queue(dev, 0) == vq ? 0 : 1;
+	VduseVirtq *vq = arg;
+	int idx = vduse_dev_get_queue(vduse_queue_get_dev(vq), 0) == vq ? 0 : 1;
 	struct fuse_session *se;
 	const struct fuse_custom_io io = {
 		.writev = stream_writev,
@@ -294,7 +296,7 @@ static void vduse_dev_enable_queue(VduseDev *dev, VduseVirtq *vq)
 	int r;
 
 	se = fuse_session_new(&args, &hello_ll_oper,
-					sizeof(hello_ll_oper), vq);
+			sizeof(hello_ll_oper), vq);
 	assert(se);
 
 	r = fuse_set_signal_handlers(se);
@@ -307,6 +309,15 @@ static void vduse_dev_enable_queue(VduseDev *dev, VduseVirtq *vq)
 	assert(r == 0);
 
 	ses[idx] = se;
+	return 0;
+}
+
+static void vduse_dev_enable_queue(VduseDev *dev, VduseVirtq *vq)
+{
+	int idx = vduse_dev_get_queue(dev, 0) == vq ? 0 : 1;
+
+	int r = thrd_create(&threads[idx], fuse_poll_queue, vq);
+	assert(r == 0);
 }
 
 static void vduse_dev_disable_queue(VduseDev *dev, VduseVirtq *vq)
