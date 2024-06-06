@@ -293,17 +293,28 @@ static ssize_t stream_read(int fd, void *buf, size_t buf_len, void *userdata) {
 
 	(void)fd;
 
-	// TODO Do we need an extra fd to exit thread?
-	int r = poll_one_forever(vduse_fd);
-	assert(r == 1);
+	do {
+		assert(!cur_elem);
+		cur_elem = vduse_queue_pop(vq, sizeof(*cur_elem));
+		if (cur_elem) {
+			break;
+		}
 
-	// We know for sure vq fd is eventfd
-	r = read(vduse_fd, (uint64_t[]){0}, sizeof(uint64_t));
-	assert(r == sizeof(uint64_t));
+		// TODO Do we need an extra fd to exit thread?
+		fprintf(stderr, "[eperezma %s:%d]poll_one_forever q=%p enter\n", __func__, __LINE__, vq);
+		int r = poll_one_forever(vduse_fd);
+		fprintf(stderr, "[eperezma %s:%d][poll_one_forever q=%p ret=%d][errno=%d]\n", __func__, __LINE__, vq, r, errno);
+		assert(r == 1);
+		fprintf(stderr, "[DEBUG poll r=%d][errno=%d]\n", r, errno);
 
-	assert(!cur_elem);
-	cur_elem = vduse_queue_pop(vq, sizeof(*cur_elem));
-	assert(cur_elem);;
+		// We know for sure vq fd is eventfd
+		r = read(vduse_fd, (uint64_t[]){0}, sizeof(uint64_t));
+		fprintf(stderr, "[DEBUG read r=%d][errno=%d]\n", r, errno);
+		if (r == -1 && errno == EAGAIN) {
+			continue;
+		}
+		assert(r == sizeof(uint64_t));
+	} while (1);
 
 	fprintf(stderr, "[DEBUG %s:%d][elem=%p]\n", __func__, __LINE__, cur_elem);
 
@@ -453,7 +464,9 @@ int main(int argc, char *argv[])
 
 	// Wait until vqs are initialized
 	while (1) {
+		fprintf(stderr, "[eperezma %s:%d][poll_one_forever devfd enter]\n", __func__, __LINE__);
 		ret = poll_one_forever(vduse_dev_get_fd(vdev));
+		fprintf(stderr, "[eperezma %s:%d][poll_one_forever devfd ret=%d][errno=%d]\n", __func__, __LINE__, ret, errno);
 		assert(ret > 0);
 
 		ret = vduse_dev_handler(vdev);
