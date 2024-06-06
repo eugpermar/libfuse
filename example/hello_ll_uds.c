@@ -195,25 +195,64 @@ static struct virtio_fs_config fs_config = {
         .num_request_queues = 1,
 };
 
+static size_t iov_copy(const struct iovec *src, int src_count, struct iovec *dest, int dest_count) {
+	size_t total_copied = 0;
+	int src_index = 0;
+	int dest_index = 0;
+	size_t src_offset = 0;
+	size_t dest_offset = 0;
+
+	while (src_index < src_count && dest_index < dest_count) {
+		// Calculate the remaining bytes in the current src and dest iovec
+		size_t src_remaining = src[src_index].iov_len - src_offset;
+		size_t dest_remaining = dest[dest_index].iov_len - dest_offset;
+
+		// Determine the amount to copy
+		size_t to_copy = src_remaining < dest_remaining ? src_remaining : dest_remaining;
+
+		// Perform the copy
+		memcpy((char *)dest[dest_index].iov_base + dest_offset,
+				(char *)src[src_index].iov_base + src_offset,
+				to_copy);
+
+		// Update offsets and total copied
+		src_offset += to_copy;
+		dest_offset += to_copy;
+		total_copied += to_copy;
+
+		// If we've exhausted the current src iovec, move to the next one
+		if (src_offset == src[src_index].iov_len) {
+			src_index++;
+			src_offset = 0;
+		}
+
+		// If we've exhausted the current dest iovec, move to the next one
+		if (dest_offset == dest[dest_index].iov_len) {
+			dest_index++;
+			dest_offset = 0;
+		}
+	}
+
+	return total_copied;
+}
+
 static ssize_t stream_writev(int fd, struct iovec *iov, int count,
                              void *userdata) {
-	(void)userdata;
+	const struct fuse_out_header *out = iov[0].iov_base;
+	VduseVirtq *vq = userdata;
+	size_t written;
 
-	ssize_t written = 0;
-	int cur = 0;
-	for (;;) {
-		written = writev(fd, iov+cur, count-cur);
-		if (written < 0)
-			return written;
+	(void)fd;
+	assert(iov[0].iov_len >= sizeof(*out));
 
-		while (cur < count && written >= iov[cur].iov_len)
-			written -= iov[cur++].iov_len;
-		if (cur == count)
-			break;
+	assert(cur_elem);
 
-		iov[cur].iov_base = (char *)iov[cur].iov_base + written;
-		iov[cur].iov_len -= written;
-	}
+	written = iov_copy(iov, count, cur_elem->in_sg, cur_elem->in_num);
+	vduse_queue_push(vq, cur_elem, written);
+	vduse_queue_notify(vq);
+
+	free(cur_elem);
+	cur_elem = NULL;
 	return written;
 }
 
@@ -248,19 +287,30 @@ static ssize_t iov_to_buf(const struct iovec *iov, int iov_count, void *buf, siz
 
 static ssize_t stream_read(int fd, void *buf, size_t buf_len, void *userdata) {
 	VduseVirtq *vq = userdata;
+	// VduseVirtqElement *elem, **added_elem;
 	ssize_t s;
+	int vduse_fd = vduse_queue_get_fd(vq);
+
 	(void)fd;
 
 	// TODO Do we need an extra fd to exit thread?
-	int r = poll_one_forever(vduse_queue_get_fd(vq));
+	int r = poll_one_forever(vduse_fd);
 	assert(r == 1);
+
+	// We know for sure vq fd is eventfd
+	r = read(vduse_fd, (uint64_t[]){0}, sizeof(uint64_t));
+	assert(r == sizeof(uint64_t));
 
 	assert(!cur_elem);
 	cur_elem = vduse_queue_pop(vq, sizeof(*cur_elem));
-	assert(cur_elem);
+	assert(cur_elem);;
+
+	fprintf(stderr, "[DEBUG %s:%d][elem=%p]\n", __func__, __LINE__, cur_elem);
 
 	s = iov_to_buf(cur_elem->out_sg, cur_elem->out_num, buf, buf_len);
-	assert(s > 0 && s <= buf_len); // return -1
+	assert(s > 0); // return -1
+	assert(s > sizeof(struct fuse_in_header));
+	assert(s <= buf_len);
 
 	return s;
 }
