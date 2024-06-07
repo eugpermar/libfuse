@@ -419,6 +419,8 @@ static VduseDev *create_vdpa(void) {
 
 	// TODO: make this configurable.
 	r = vduse_set_reconnect_log_file(vduse_dev, "/tmp/vduse_reconnect.log");
+	assert(r == 0);
+	r = unlink("/tmp/vduse_reconnect.log");
 
 	for (int i = 0; i < num_queues; ++i) {
 		r = vduse_dev_setup_queue(vduse_dev, i, q_size);
