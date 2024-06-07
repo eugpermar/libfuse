@@ -330,6 +330,7 @@ static ssize_t stream_splice_send(int fdin, off_t *offin, int fdout,
 					    off_t *offout, size_t len,
                                   unsigned int flags, void *userdata) {
 	(void)userdata;
+	assert(!"splice send unsupported ATM");
 
 	size_t count = 0;
 	while (count < len) {
