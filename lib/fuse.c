@@ -16,6 +16,11 @@
 #include "fuse_misc.h"
 #include "fuse_kernel.h"
 
+#include "libvduse.h"
+#include "standard-headers/linux/vdpa.h"
+#include "standard-headers/linux/virtio_fs.h"
+#include "standard-headers/linux/virtio_ring.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -30,7 +35,9 @@
 #include <dlfcn.h>
 #include <assert.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/param.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -52,6 +59,8 @@
 #define OFFSET_MAX 0x7fffffffffffffffLL
 
 #define NODE_TABLE_MIN_SIZE 8192
+
+#define VDUSE_NUM_QUEUES 2
 
 struct fuse_fs {
 	struct fuse_operations op;
@@ -104,8 +113,19 @@ struct node_slab {
 	int used;
 };
 
+struct fuse_vduse_dev {
+	VduseDev *dev;
+	size_t num_enabled_queues;
+
+	/* Auxiliary bufvec to use in the io read and write functions. They're
+	 * invalid at function exit */
+	struct fuse_bufvec *dst, *src;
+	size_t dst_size, src_size;
+};
+
 struct fuse {
 	struct fuse_session *se;
+	struct fuse_vduse_dev vdpa;
 	struct node_table name_table;
 	struct node_table id_table;
 	struct list_head lru_table;
@@ -199,6 +219,12 @@ thread_local struct fuse_cb_virtq_elem *cur_elem;
 static pthread_mutex_t fuse_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static int fuse_context_ref;
 static struct fuse_module *fuse_modules = NULL;
+
+static struct virtio_fs_config fs_config = {
+        .tag = "a",
+        /* -1 because HIPRIO */
+        .num_request_queues = VDUSE_NUM_QUEUES - 1,
+};
 
 static int fuse_register_module(const char *name,
 				fuse_module_factory_t factory,
@@ -4914,6 +4940,309 @@ void fuse_stop_cleanup_thread(struct fuse *f)
 	}
 }
 
+struct fuse_cb_virtq_elem {
+	VduseVirtqElement elem;
+	VduseVirtq *vq;
+};
+
+static struct fuse_bufvec *realloc_bufvec(struct fuse_bufvec *bufv,
+					  size_t *cur_num_bufs,
+					  size_t num_bufs) {
+	struct fuse_bufvec *ret;
+	size_t bufs_size, new_size;
+	bool overflow;
+
+	assert(num_bufs > 0);
+	if (bufv && (*cur_num_bufs) >= num_bufs) {
+		ret = bufv;
+		goto out;
+	}
+
+	overflow = __builtin_mul_overflow(num_bufs, sizeof(bufv->buf[0]),
+	                                  &bufs_size);
+	assert(!overflow);
+
+	overflow = __builtin_add_overflow(offsetof(typeof(*bufv), buf),
+					  bufs_size, &new_size);
+	assert(!overflow);
+
+	ret = realloc(bufv, new_size);
+	assert(ret);
+
+	*cur_num_bufs = num_bufs;
+
+out:
+	ret->count = num_bufs;
+	ret->idx = 0;
+	ret->off = 0;
+	return ret;
+}
+
+static ssize_t vdpa_read_int(void *buf, size_t buf_len, struct fuse *fuse,
+                             int stop_fd)
+{
+	static int revents = POLLIN | POLLPRI;
+        struct fuse_vduse_dev *vdev = &fuse->vdpa;
+        int vduse_fd = vduse_dev_get_fd(vdev->dev);
+	const struct fuse_in_header *in;
+	ssize_t written;
+
+	fprintf(stderr, "[eperezma %s:%d] A\n", __func__, __LINE__);
+	do {
+		static int infinite_timeout = -1;
+		struct pollfd pollfds[VDUSE_NUM_QUEUES + 2] = {
+			{
+				/* First fd is device, always valid. */
+				.fd = vduse_fd,
+				.events = revents,
+			}, {
+				/* Second fd is the stop eventfd, sometimes
+				 * -1. The rest are vqs.
+				 */
+				.fd = stop_fd,
+				.events = revents,
+			},
+		};
+		nfds_t nfds = 2;
+		int r;
+		VduseVirtq *vqs[4];
+		struct fuse_session *se = fuse->se;
+
+		/* It is important to fill the data in every iteration, as
+		 * vduse may change the number of queues */
+		for (size_t i = 0; i < VDUSE_NUM_QUEUES; ++i) {
+			VduseVirtq *vq = vduse_dev_get_queue(vdev->dev, i);
+			int q_fd = vduse_queue_get_fd(vq);
+
+			fprintf(stderr, "[eperezma %s:%d][i=%zu][q_fd=%d]\n", __func__, __LINE__, i, q_fd);
+			pollfds[nfds].fd = q_fd;
+			pollfds[nfds].events = revents;
+			vqs[nfds] = vq;
+			nfds++;
+		}
+
+		/* TODO: Avoid so many calls to poll! Store all descs in a list
+		 * and iterate before poll
+		 */
+		fprintf(stderr, "[eperezma %s:%d][nfds=%ld][fd0=%d][fd1=%d][fd2=%d][fd3=%d]\n", __func__, __LINE__, nfds, pollfds[0].fd, pollfds[1].fd, pollfds[2].fd, pollfds[3].fd);
+		r = poll(pollfds, nfds, infinite_timeout);
+                fprintf(stderr, "[DEBUG poll r=%d][errno=%d]\n", r, errno);
+
+		/* TODO: Include exit signal */
+		if (r <= 0) {
+			fprintf(stderr, "[ERR %s:%d][r=%d][errno=%d] poll error\n", __func__, __LINE__, r, errno);
+			if (errno == EINTR) {
+				return 0;
+			}
+			assert(0);
+		}
+		if (fuse_session_exited(se)) {
+			/* Intruct caller we need to exit */
+			errno = EAGAIN;
+			return -1;
+		}
+
+		if (pollfds[0].revents) {
+			size_t num_enabled_queues = vdev->num_enabled_queues;
+
+			if (pollfds[0].revents & POLLERR) {
+				int error = 0;
+
+				getsockopt(pollfds[0].fd, SOL_SOCKET, SO_ERROR, (void *)&error, (socklen_t []){sizeof(error)});
+				fprintf(stderr, "[eperezma %s:%d][POLLERR error=%d]\n", __func__, __LINE__, error);
+				assert(!"Returned pollerr");
+			}
+			if (pollfds[0].revents & POLLHUP) {
+				fprintf(stderr, "[POLLHUP]\n");
+			}
+			assert(!(pollfds[0].revents & POLLNVAL));
+			r = vduse_dev_handler(vdev->dev);
+			// We know for sure vq fd is eventfd
+			fprintf(stderr, "[DEBUG read r=%d][errno=%d]\n", r, errno);
+			if (r < 0) {
+				if (errno == EAGAIN) {
+					continue;
+				} else {
+					fprintf(stderr, "[DEBUG read r=%d][errno=%d]\n", r, errno);
+				}
+				assert(0);
+			}
+			if (num_enabled_queues &&
+			    vdev->num_enabled_queues == 0) {
+				return -ENODEV;
+			}
+
+			continue;
+		}
+
+		if (pollfds[1].revents) {
+			assert(!(pollfds[0].revents & POLLERR));
+			if (pollfds[0].revents & POLLHUP) {
+				fprintf(stderr, "[POLLHUP]\n");
+			}
+			assert(!(pollfds[0].revents & POLLNVAL));
+			return 0;
+		}
+
+		for (nfds_t i = 2; i < nfds; ++i) {
+			uint64_t read_val;
+			if (!(pollfds[i].revents & revents)) {
+				continue;
+			}
+
+			assert(!cur_elem);
+			cur_elem = vduse_queue_pop(vqs[i], sizeof(*cur_elem));
+			if (cur_elem) {
+				cur_elem->vq = vqs[i];
+				break;
+			} else {
+				/* Remove poll */
+				r = read(pollfds[i].fd, &read_val, sizeof(read_val));
+				/* Either another thread removed data or we are removing it */
+				if (!(r == 8 || (r == -1 && errno == EAGAIN))) {
+					fprintf(stderr, "[eperezma %s:%d] Cannot read %d: %s(%d)", __func__, __LINE__, r, strerror(errno), errno);
+				}
+				assert(r == 8 || (r == -1 && errno == EAGAIN));
+				cur_elem = vduse_queue_pop(vqs[i], sizeof(*cur_elem));
+				if (cur_elem) {
+					cur_elem->vq = vqs[i];
+					break;
+				}
+			}
+		}
+        } while (!cur_elem);
+
+	vdev->dst = realloc_bufvec(vdev->dst, &vdev->dst_size, 1);
+	vdev->dst->buf[0] = (typeof(vdev->dst->buf[0])){
+		.mem = buf,
+		.size = buf_len,
+	};
+	vdev->dst->buf[0].size = buf_len;
+	vdev->src = realloc_bufvec(vdev->src, &vdev->src_size,
+				   cur_elem->elem.out_num);
+	for (unsigned int i = 0; i < cur_elem->elem.out_num; i++) {
+		vdev->src->buf[i] = (typeof(vdev->src->buf[0])){
+			.mem = cur_elem->elem.out_sg[i].iov_base,
+			.size = cur_elem->elem.out_sg[i].iov_len,
+		};
+	}
+
+	written = fuse_buf_copy(vdev->dst, vdev->src, /*no flags */ 0);
+
+	in = buf;
+        fprintf(stderr, "[DEBUG %s:%d][vq=%p][POP elem=%p][in->opcode=%u]\n", __func__, __LINE__, cur_elem->vq, cur_elem, in->opcode);
+	if (in->opcode == FUSE_FORGET
+	    /* || in->opcode == FUSE_BATCH_FORGET */) {
+		/* This opcode does not return data to the driver so
+		 * push fn is never called.  Since we cannot return
+		 * error to the driver either as in_num == 0, push the
+		 * buffer here */
+		vduse_queue_push(cur_elem->vq, &cur_elem->elem, 0);
+		vduse_queue_notify(cur_elem->vq);
+	}
+
+	return written;
+}
+
+static ssize_t vdpa_read(int fd, void *buf, size_t buf_len, void *userdata) {
+        struct fuse *fuse = userdata;
+        (void)fd;
+
+	return vdpa_read_int(buf, buf_len, fuse, -1);
+}
+
+static ssize_t vdpa_writev(int fd, struct iovec *iov, int count,
+		           void *userdata) {
+        const struct fuse_out_header *out = iov[0].iov_base;
+        struct fuse *fuse = userdata;
+        struct fuse_vduse_dev *vdev = &fuse->vdpa;
+        size_t written;
+
+        (void)fd;
+        assert(iov[0].iov_len >= sizeof(*out));
+
+        assert(cur_elem);
+
+	vdev->dst = realloc_bufvec(vdev->dst, &vdev->dst_size,
+				   cur_elem->elem.in_num);
+	for (unsigned int i = 0; i < cur_elem->elem.in_num; ++i) {
+		vdev->dst->buf[i] = (typeof(vdev->dst->buf[0])){
+			.mem = cur_elem->elem.in_sg[i].iov_base,
+			.size = cur_elem->elem.in_sg[i].iov_len,
+		};
+	}
+
+	vdev->src = realloc_bufvec(vdev->src, &vdev->src_size, count);
+	for (unsigned int i = 0; i < count; ++i) {
+		vdev->src->buf[i] = (typeof(vdev->src->buf[0])){
+			.mem = iov[i].iov_base,
+			.size = iov[i].iov_len,
+		};
+	}
+
+	written = fuse_buf_copy(vdev->dst, vdev->src, /*no flags */ 0);
+        vduse_queue_push(cur_elem->vq, &cur_elem->elem, written);
+        vduse_queue_notify(cur_elem->vq);
+        fprintf(stderr, "[DEBUG %s:%d][vq=%p][PUSH elem=%p written=%zu][len=%u][error=%d][unique=%lu]\n", __func__, __LINE__, cur_elem->vq, cur_elem, written, out->len, out->error, out->unique);
+
+        return written;
+}
+
+static void vduse_dev_enable_queue(VduseDev *dev, VduseVirtq *vq)
+{
+	(void)vq;
+
+	struct fuse *f = vduse_dev_get_priv(dev);
+	f->vdpa.num_enabled_queues++;
+}
+
+static void vduse_dev_disable_queue(VduseDev *dev, VduseVirtq *vq)
+{
+	(void)vq;
+
+	struct fuse *f = vduse_dev_get_priv(dev);
+	f->vdpa.num_enabled_queues--;
+}
+
+static const VduseOps vduse_ops = {
+        /* Called when virtqueue can be processed */
+        .enable_queue = vduse_dev_enable_queue,
+        /* Called when virtqueue processing should be stopped */
+        .disable_queue = vduse_dev_disable_queue,
+};
+
+static VduseDev *create_vdpa(struct fuse *priv) {
+        static const char *vduse_name = "fsd";
+        size_t q_size = 1024;
+        uint32_t device_id = VIRTIO_ID_FS;
+        uint32_t vendor_id = /* #define PCI_VENDOR_ID_REDHAT */ 0x1b36;
+        uint64_t features = 1ULL << VIRTIO_F_VERSION_1
+                        | 1ULL << VIRTIO_RING_F_INDIRECT_DESC
+                        | 1ULL << VIRTIO_RING_F_EVENT_IDX
+                        | 1ULL << 33 /* VIRTIO_F_ACCESS_PLATFORM */;
+        uint32_t config_size = sizeof(fs_config);
+        static VduseDev *vduse_dev;
+        char *config = (void *)&fs_config;
+        int r;
+
+        vduse_dev = vduse_dev_create(vduse_name, device_id, vendor_id,
+                                     features, VDUSE_NUM_QUEUES, config_size,
+				     config, &vduse_ops, priv);
+        assert(vduse_dev);
+
+        // TODO: make this configurable.
+        r = vduse_set_reconnect_log_file(vduse_dev, "/tmp/vduse_reconnect.log");
+        assert(r == 0);
+        r = unlink("/tmp/vduse_reconnect.log");
+
+        for (int i = 0; i < VDUSE_NUM_QUEUES; ++i) {
+                r = vduse_dev_setup_queue(vduse_dev, i, q_size);
+                assert(r == 0);
+        }
+
+        return vduse_dev;
+}
+
 /*
  * Not supposed to be called directly, but supposed to be called
  * through the fuse_new macro
@@ -4928,10 +5257,16 @@ struct fuse *_fuse_new_317(struct fuse_args *args,
 			   size_t op_size, struct libfuse_version *version,
 			   void *user_data)
 {
+	static const struct fuse_custom_io vdpa_io = {
+		.writev = vdpa_writev,
+		.read = vdpa_read,
+	};
+
 	struct fuse *f;
 	struct node *root;
 	struct fuse_fs *fs;
 	struct fuse_lowlevel_ops llop = fuse_path_ops;
+	int r;
 
 	f = (struct fuse *) calloc(1, sizeof(struct fuse));
 	if (f == NULL) {
@@ -5008,9 +5343,19 @@ struct fuse *_fuse_new_317(struct fuse_args *args,
 	f->conf.readdir_ino = 1;
 #endif
 
+	r = system("modprobe virtio_vdpa");
+	assert(WIFEXITED(r));
+	assert(WEXITSTATUS(r) == 0);
+
+	f->vdpa.dev = create_vdpa(f);
+
 	f->se = _fuse_session_new(args, &llop, sizeof(llop), version, f);
 	if (f->se == NULL)
 		goto out_free_fs;
+
+	r = fuse_session_custom_io(f->se, &vdpa_io, sizeof(vdpa_io),
+			/* Unused? */ vduse_dev_get_fd(f->vdpa.dev));
+	assert(r == 0);
 
 	if (f->conf.debug) {
 		fuse_log(FUSE_LOG_DEBUG, "nullpath_ok: %i\n", f->conf.nullpath_ok);

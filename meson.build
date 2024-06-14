@@ -212,7 +212,7 @@ configure_file(output: 'libfuse_config.h',
                install: true, install_dir: join_paths(get_option('includedir'), 'fuse3'))
 
 # '.' will refer to current build directory, which contains config.h
-include_dirs = include_directories('include', 'lib', '.')
+include_dirs = include_directories('include', 'lib', '.', '/usr/include/libnl3')
 
 # Common dependencies
 thread_dep = dependency('threads') 

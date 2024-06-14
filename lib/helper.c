@@ -351,6 +351,8 @@ int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 		goto out1;
 	}
 
+	fuse_log(FUSE_LOG_NOTICE,
+		 "fuse: waiting for the virtio driver contact vduse dev\n");
 	if (fuse_mount(fuse,opts.mountpoint) != 0) {
 		res = 4;
 		goto out2;

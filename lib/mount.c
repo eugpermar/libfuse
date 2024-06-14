@@ -17,6 +17,12 @@
 #include "fuse_opt.h"
 #include "mount_util.h"
 
+#include <netlink/socket.h>
+#include <netlink/genl/genl.h>
+#include <netlink/genl/ctrl.h>
+
+#include <standard-headers/linux/vdpa.h>
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -481,15 +487,173 @@ static int fuse_mount_fusermount(const char *mountpoint, struct mount_opts *mo,
 	return fd;
 }
 
-#ifndef O_CLOEXEC
-#define O_CLOEXEC 0
+/* Copied from kernel doc vduse */
+static int netlink_add_vduse(const char *name)
+{
+	char unbind_path[256];
+	char driver_path[256];
+	const char *driver_name;
+        struct nl_sock *nlsock;
+        struct nl_msg *msg;
+        int famid, res /*, fd */;
+
+        nlsock = nl_socket_alloc();
+        if (!nlsock)
+                return -ENOMEM;
+
+        if (genl_connect(nlsock))
+                goto free_sock;
+
+        famid = genl_ctrl_resolve(nlsock, VDPA_GENL_NAME);
+        if (famid < 0)
+                goto close_sock;
+
+        msg = nlmsg_alloc();
+        if (!msg)
+                goto close_sock;
+
+        if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, famid, 0, 0, VDPA_CMD_DEV_NEW, 0))
+                goto nla_put_failure;
+
+        NLA_PUT_STRING(msg, VDPA_ATTR_DEV_NAME, name);
+	NLA_PUT_STRING(msg, VDPA_ATTR_MGMTDEV_DEV_NAME, "vduse");
+
+        if (nl_send_sync(nlsock, msg))
+                goto close_sock;
+
+        nl_close(nlsock);
+        nl_socket_free(nlsock);
+
+	res = snprintf(unbind_path, sizeof(unbind_path),
+		       "/sys/bus/vdpa/devices/%s/driver/unbind", name);
+	assert (res > sizeof("unbind") && res < sizeof(unbind_path) - 1);
+
+	unbind_path[res-sizeof("unbind")] = '\0';
+	res = readlink(unbind_path, driver_path, sizeof(driver_path));
+	assert(res < sizeof(driver_path));
+	driver_name = strrchr(driver_path, '/');
+	assert(driver_name);
+	driver_name++; // skip '/'
+	assert(!strcmp(driver_name, "virtio_vdpa"));
+#if 0
+	if (access(unbind_path, F_OK) == 0) {
+		unbind_path[39-sizeof("unbind")] = '\0';
+
+		fd = open(unbind_path, O_WRONLY);
+		if (fd < 0) {
+			perror("Failed to open unbind file");
+			assert(0);
+		}
+
+		if (write(fd, name, strlen(name)) != 3) {
+			perror("Failed to write to unbind file");
+			assert(0);
+		}
+
+		close(fd);
+	}
+
+	fd = open("/sys/bus/vdpa/drivers/virtio_vdpa/bind", O_WRONLY);
+	assert (fd >= 0);
+	res = write(fd, name, strlen(name));
+	fprintf(stderr, "[eperezma %s:%d][len=%d]\n", __func__, __LINE__, res);
+	assert(res == 3);
 #endif
+
+	return 0;
+nla_put_failure:
+        nlmsg_free(msg);
+close_sock:
+        nl_close(nlsock);
+free_sock:
+        nl_socket_free(nlsock);
+        return -1;
+}
+
+struct fuse_mount_sys_thrd_args {
+	const char *mnt;
+	struct mount_opts *mo;
+	const char *mnt_opts;
+	const char *vduse_name;
+};
+
+static void *fuse_mount_sys_thrd(void *pargs) {
+	const char *source = "a";
+	const char *type = "virtiofs";
+	struct fuse_mount_sys_thrd_args *args = pargs;
+	int res;
+
+	res = netlink_add_vduse(args->vduse_name);
+
+	fprintf(stderr, "[eperezma %s:%d][source=%s]\n", __func__, __LINE__, source);
+	fprintf(stderr, "[eperezma %s:%d][mnt=%s]\n", __func__, __LINE__, args->mnt);
+	fprintf(stderr, "[eperezma %s:%d][type=%s]\n", __func__, __LINE__, type);
+	res = mount(source, args->mnt, type, /* mo->flags */ 0, /* args->mo->kernel_opts */ 0);
+	fprintf(stderr, "[eperezma %s:%d][mount res=%d]\n", __func__, __LINE__, res);
+	if (res == -1 && errno == ENODEV && args->mo->subtype) {
+		assert(!"subtype not supported");
+		/* Probably missing subtype support */
+	}
+	if (res == -1) {
+		assert(!"Not trying fusermount");
+		/*
+		 * Maybe kernel doesn't support unprivileged mounts, in this
+		 * case try falling back to fusermount3
+		 */
+		if (errno == EPERM) {
+			res = -2;
+		} else {
+			int errno_save = errno;
+			if (args->mo->blkdev && errno == ENODEV &&
+			    !fuse_mnt_check_fuseblk())
+				fuse_log(FUSE_LOG_ERR,
+					"fuse: 'fuseblk' support missing\n");
+			else
+				fuse_log(FUSE_LOG_ERR, "fuse: mount failed: %s\n",
+					strerror(errno_save));
+		}
+
+		goto out_close;
+	}
+
+#ifndef IGNORE_MTAB
+	if (geteuid() == 0) {
+		char *newmnt = fuse_mnt_resolve_path("fuse", args->mnt);
+		res = -1;
+		if (!newmnt)
+			goto out_umount;
+
+		res = fuse_mnt_add_mount("fuse", source, newmnt, type,
+					 args->mnt_opts);
+		free(newmnt);
+		if (res == -1)
+			goto out_umount;
+	}
+#endif /* IGNORE_MTAB */
+
+	return (intptr_t)0;
+
+out_umount:
+	umount2(args->mnt, 2); /* lazy umount */
+out_close:
+	assert(!"Couldn't mount");
+}
 
 static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
 			  const char *mnt_opts)
 {
-	const char *source = "a";
-	const char *type = "virtiofs";
+	const char *name = "fsd";
+	// TODO make not static
+	static struct fuse_mount_sys_thrd_args thrd_args;
+	thrd_args = (struct fuse_mount_sys_thrd_args){
+		.mnt = mnt,
+		.mo = mo,
+		.mnt_opts = mnt_opts,
+		.vduse_name = name,
+	};
+
+	pthread_t thrd;
+	pthread_attr_t attr;
 	struct stat stbuf;
 	int res;
 
@@ -509,54 +673,15 @@ static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
 		assert(!"fuseblk not supported");
 	}
 
-	res = mount(source, mnt, type, mo->flags, mo->kernel_opts);
-	if (res == -1 && errno == ENODEV && mo->subtype) {
-		assert(!"subtype not supported");
-		/* Probably missing subtype support */
-	}
-	if (res == -1) {
-		assert(!"Not trying fusermount");
-		/*
-		 * Maybe kernel doesn't support unprivileged mounts, in this
-		 * case try falling back to fusermount3
-		 */
-		if (errno == EPERM) {
-			res = -2;
-		} else {
-			int errno_save = errno;
-			if (mo->blkdev && errno == ENODEV &&
-			    !fuse_mnt_check_fuseblk())
-				fuse_log(FUSE_LOG_ERR,
-					"fuse: 'fuseblk' support missing\n");
-			else
-				fuse_log(FUSE_LOG_ERR, "fuse: mount failed: %s\n",
-					strerror(errno_save));
-		}
+	res = pthread_attr_init(&attr);
+	assert(res==0);
+	res = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	assert(res==0);
+	res = pthread_create(&thrd, &attr, fuse_mount_sys_thrd, &thrd_args);
+	assert(res==0);
+	pthread_attr_destroy(&attr);
 
-		goto out_close;
-	}
-
-#ifndef IGNORE_MTAB
-	if (geteuid() == 0) {
-		char *newmnt = fuse_mnt_resolve_path("fuse", mnt);
-		res = -1;
-		if (!newmnt)
-			goto out_umount;
-
-		res = fuse_mnt_add_mount("fuse", source, newmnt, type,
-					 mnt_opts);
-		free(newmnt);
-		if (res == -1)
-			goto out_umount;
-	}
-#endif /* IGNORE_MTAB */
-
-	return 0;
-
-out_umount:
-	umount2(mnt, 2); /* lazy umount */
-out_close:
-	return -1;
+ 	return res;
 }
 
 static int get_mnt_flag_opts(char **mnt_optsp, int flags)
