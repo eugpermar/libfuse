@@ -17,6 +17,7 @@
 #include "fuse_lowlevel.h"
 #include "mount_util.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -366,9 +367,10 @@ int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 		goto out3;
 	}
 
-	if (opts.singlethread)
+	if (opts.singlethread) {
+		assert(!"single thread not supported");
 		res = fuse_loop(fuse);
-	else {
+	} else {
 		loop_config = fuse_loop_cfg_create();
 		if (loop_config == NULL) {
 			res = 7;
