@@ -53,7 +53,8 @@ struct fuse_notify_req {
 struct fuse_session {
 	char *mountpoint;
 	volatile int exited;
-	int fd;
+	// TODO replace by vdpa_dev?
+	// int fd;
 	struct fuse_custom_io *io;
 	struct mount_opts *mo;
 	int debug;

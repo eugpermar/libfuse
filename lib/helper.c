@@ -483,6 +483,7 @@ int fuse_open_channel(const char *mountpoint, const char* options)
 	int argc = sizeof(argv) / sizeof(argv[0]);
 	struct fuse_args args = FUSE_ARGS_INIT(argc, (char**) argv);
 
+	assert(!"Call to fuse_open_channel not supported");
 	opts = parse_mount_opts(&args);
 	if (opts == NULL)
 		return -1;

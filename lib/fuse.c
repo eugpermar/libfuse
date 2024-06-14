@@ -4525,13 +4525,13 @@ static int fuse_session_loop_remember(struct fuse *f)
 	struct timespec now;
 	time_t next_clean;
 	struct pollfd fds = {
-		.fd = se->fd,
 		.events = POLLIN
 	};
 	struct fuse_buf fbuf = {
 		.mem = NULL,
 	};
 
+	assert(!"session_loop_remember not supported");
 	curr_time(&now);
 	next_clean = now.tv_sec;
 	while (!fuse_session_exited(se)) {

@@ -17,6 +17,7 @@
 #include "fuse_opt.h"
 #include "mount_util.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -487,12 +488,9 @@ static int fuse_mount_fusermount(const char *mountpoint, struct mount_opts *mo,
 static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
 			  const char *mnt_opts)
 {
-	char tmp[128];
-	const char *devname = "/dev/fuse";
-	char *source = NULL;
-	char *type = NULL;
+	const char *source = "a";
+	const char *type = "virtiofs";
 	struct stat stbuf;
-	int fd;
 	int res;
 
 	if (!mnt) {
@@ -507,57 +505,17 @@ static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
 		return -1;
 	}
 
-	fd = open(devname, O_RDWR | O_CLOEXEC);
-	if (fd == -1) {
-		if (errno == ENODEV || errno == ENOENT)
-			fuse_log(FUSE_LOG_ERR, "fuse: device not found, try 'modprobe fuse' first\n");
-		else
-			fuse_log(FUSE_LOG_ERR, "fuse: failed to open %s: %s\n",
-				devname, strerror(errno));
-		return -1;
+	if (mo->blkdev) {
+		assert(!"fuseblk not supported");
 	}
-	if (!O_CLOEXEC)
-		fcntl(fd, F_SETFD, FD_CLOEXEC);
-
-	snprintf(tmp, sizeof(tmp),  "fd=%i,rootmode=%o,user_id=%u,group_id=%u",
-		 fd, stbuf.st_mode & S_IFMT, getuid(), getgid());
-
-	res = fuse_opt_add_opt(&mo->kernel_opts, tmp);
-	if (res == -1)
-		goto out_close;
-
-	source = malloc((mo->fsname ? strlen(mo->fsname) : 0) +
-			(mo->subtype ? strlen(mo->subtype) : 0) +
-			strlen(devname) + 32);
-
-	type = malloc((mo->subtype ? strlen(mo->subtype) : 0) + 32);
-	if (!type || !source) {
-		fuse_log(FUSE_LOG_ERR, "fuse: failed to allocate memory\n");
-		goto out_close;
-	}
-
-	strcpy(type, mo->blkdev ? "fuseblk" : "fuse");
-	if (mo->subtype) {
-		strcat(type, ".");
-		strcat(type, mo->subtype);
-	}
-	strcpy(source,
-	       mo->fsname ? mo->fsname : (mo->subtype ? mo->subtype : devname));
 
 	res = mount(source, mnt, type, mo->flags, mo->kernel_opts);
 	if (res == -1 && errno == ENODEV && mo->subtype) {
+		assert(!"subtype not supported");
 		/* Probably missing subtype support */
-		strcpy(type, mo->blkdev ? "fuseblk" : "fuse");
-		if (mo->fsname) {
-			if (!mo->blkdev)
-				sprintf(source, "%s#%s", mo->subtype,
-					mo->fsname);
-		} else {
-			strcpy(source, type);
-		}
-		res = mount(source, mnt, type, mo->flags, mo->kernel_opts);
 	}
 	if (res == -1) {
+		assert(!"Not trying fusermount");
 		/*
 		 * Maybe kernel doesn't support unprivileged mounts, in this
 		 * case try falling back to fusermount3
@@ -592,18 +550,13 @@ static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
 			goto out_umount;
 	}
 #endif /* IGNORE_MTAB */
-	free(type);
-	free(source);
 
-	return fd;
+	return 0;
 
 out_umount:
 	umount2(mnt, 2); /* lazy umount */
 out_close:
-	free(type);
-	free(source);
-	close(fd);
-	return res;
+	return -1;
 }
 
 static int get_mnt_flag_opts(char **mnt_optsp, int flags)
@@ -669,7 +622,8 @@ int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo)
 		goto out;
 
 	res = fuse_mount_sys(mountpoint, mo, mnt_opts);
-	if (res >= 0 && mo->auto_unmount) {
+	if (res == 0 && mo->auto_unmount) {
+		assert(!"Autounmount not supported");
 		if(0 > setup_auto_unmount(mountpoint, 0)) {
 			// Something went wrong, let's umount like in fuse_mount_sys.
 			umount2(mountpoint, MNT_DETACH); /* lazy umount */
