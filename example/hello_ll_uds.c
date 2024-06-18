@@ -30,6 +30,11 @@
 #include "libvduse.h"
 #include "standard-headers/linux/virtio_fs.h"
 #include "standard-headers/linux/virtio_ring.h"
+#include <standard-headers/linux/vdpa.h>
+
+#include <netlink/socket.h>
+#include <netlink/genl/genl.h>
+#include <netlink/genl/ctrl.h>
 
 #include <fuse_lowlevel.h>
 #include <fuse_kernel.h>
@@ -397,6 +402,51 @@ static const VduseOps vduse_ops = {
         .disable_queue = vduse_dev_disable_queue,
 };
 
+/* Copied from kernel doc vduse */
+static int netlink_add_vduse(const char *name, enum vdpa_command cmd)
+{
+        struct nl_sock *nlsock;
+        struct nl_msg *msg;
+        int famid;
+
+        nlsock = nl_socket_alloc();
+        if (!nlsock)
+                return -ENOMEM;
+
+        if (genl_connect(nlsock))
+                goto free_sock;
+
+        famid = genl_ctrl_resolve(nlsock, VDPA_GENL_NAME);
+        if (famid < 0)
+                goto close_sock;
+
+        msg = nlmsg_alloc();
+        if (!msg)
+                goto close_sock;
+
+        if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, famid, 0, 0, cmd, 0))
+                goto nla_put_failure;
+
+        NLA_PUT_STRING(msg, VDPA_ATTR_DEV_NAME, name);
+        if (cmd == VDPA_CMD_DEV_NEW)
+                NLA_PUT_STRING(msg, VDPA_ATTR_MGMTDEV_DEV_NAME, "vduse");
+
+        if (nl_send_sync(nlsock, msg))
+                goto close_sock;
+
+        nl_close(nlsock);
+        nl_socket_free(nlsock);
+
+        return 0;
+nla_put_failure:
+        nlmsg_free(msg);
+close_sock:
+        nl_close(nlsock);
+free_sock:
+        nl_socket_free(nlsock);
+        return -1;
+}
+
 static VduseDev *create_vdpa(void) {
 	static const char *vduse_name = "fsd";
 	size_t q_size = 1024;
@@ -427,6 +477,9 @@ static VduseDev *create_vdpa(void) {
 		r = vduse_dev_setup_queue(vduse_dev, i, q_size);
 		assert(r == 0);
 	}
+
+	r = netlink_add_vduse("fsd", VDPA_CMD_DEV_NEW);
+	assert (r == 0);
 
 	return vduse_dev;
 }
