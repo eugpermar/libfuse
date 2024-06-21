@@ -495,6 +495,14 @@ static void fuse_cmdline_help_uds(void)
 	       "    -d   -o debug          enable debug output (implies -f)\n");
 }
 
+static int mount_thread(void *arg)
+{
+	(void)arg;
+	int r = mount("a", "/mnt", "virtiofs", 0 /* mountflags */, NULL /* data */);
+	assert(r == 0);
+	return r;
+}
+
 int main(int argc, char *argv[])
 {
 	args = (typeof(args))FUSE_ARGS_INIT(argc, argv);
@@ -523,7 +531,6 @@ int main(int argc, char *argv[])
 	if (!vdev)
 		goto err;
 
-
 	// Wait until vqs are initialized
 	while (1) {
 		fprintf(stderr, "[eperezma %s:%d][poll_one_forever devfd enter]\n", __func__, __LINE__);
@@ -535,8 +542,14 @@ int main(int argc, char *argv[])
 		assert(ret == 0);
 
 		if (!mount_called && q_started == 2) {
-			int r = mount("a", "/mnt", "virtiofs", 0 /* mountflags */, NULL /* data */);
-			assert(r == 0);
+			/* We need a thread as mount() needs the device to
+			 * answer
+			 */
+			thrd_t thread;
+			int r = thrd_create(&thread, mount_thread, NULL);
+			assert(r == thrd_success);
+			r = thrd_detach(thread);
+			assert(r == thrd_success);
 			mount_called = true;
 		}
 	}
