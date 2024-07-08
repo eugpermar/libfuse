@@ -356,6 +356,9 @@ int fuse_main_real_317(int argc, char *argv[], const struct fuse_operations *op,
 		goto out2;
 	}
 
+	if (!opts.foreground) {
+		assert(!"Daemon operation without -f not supported");
+	}
 	if (fuse_daemonize(opts.foreground) != 0) {
 		res = 5;
 		goto out3;
