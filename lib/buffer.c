@@ -244,12 +244,16 @@ static ssize_t fuse_buf_copy_one(const struct fuse_buf *dst, size_t dst_off,
 
 		return len;
 	} else if (!src_is_fd) {
+		assert(0);
 		return fuse_buf_write(dst, dst_off, src, src_off, len);
 	} else if (!dst_is_fd) {
+		assert(0);
 		return fuse_buf_read(dst, dst_off, src, src_off, len);
 	} else if (flags & FUSE_BUF_NO_SPLICE) {
+		assert(0);
 		return fuse_buf_fd_to_fd(dst, dst_off, src, src_off, len);
 	} else {
+		assert(0);
 		return fuse_buf_splice(dst, dst_off, src, src_off, len, flags);
 	}
 }
