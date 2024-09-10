@@ -121,6 +121,7 @@ struct fuse_vduse_dev {
 	 * invalid at function exit */
 	struct fuse_bufvec *dst, *src;
 	size_t dst_size, src_size;
+	uint64_t ready_vqs;
 };
 
 struct fuse {
@@ -4987,78 +4988,82 @@ static ssize_t vdpa_read_int(void *buf, size_t buf_len, struct fuse *fuse,
 	const struct fuse_in_header *in;
 	ssize_t written;
 
-	fprintf(stderr, "[eperezma %s:%d] A\n", __func__, __LINE__);
 	do {
-		static int infinite_timeout = -1;
-		struct pollfd pollfds[VDUSE_NUM_QUEUES + 2] = {
-			{
-				/* First fd is device, always valid. */
-				.fd = vduse_fd,
-				.events = revents,
-			}, {
-				/* Second fd is the stop eventfd, sometimes
-				 * -1. The rest are vqs.
-				 */
-				.fd = stop_fd,
-				.events = revents,
-			},
-		};
-		nfds_t nfds = 2;
 		int r;
-		VduseVirtq *vqs[4];
-		struct fuse_session *se = fuse->se;
+		nfds_t nfds = VDUSE_NUM_QUEUES + 2;
 
-		/* It is important to fill the data in every iteration, as
-		 * vduse may change the number of queues */
-		for (size_t i = 0; i < VDUSE_NUM_QUEUES; ++i) {
-			VduseVirtq *vq = vduse_dev_get_queue(vdev->dev, i);
-			int q_fd = vduse_queue_get_fd(vq);
+		if (!vdev->ready_vqs) {
+			static int infinite_timeout = -1;
+			struct pollfd pollfds[VDUSE_NUM_QUEUES + 2] = {
+				{
+					/* First fd is device, always valid. */
+					.fd = vduse_fd,
+					.events = revents,
+				}, {
+					/* Second fd is the stop eventfd, sometimes
+					 * -1. The rest are vqs.
+					 */
+					.fd = stop_fd,
+					.events = revents,
+				},
+			};
+			int r;
+			typeof(vdev->ready_vqs) new_ready_vqs = 0;
 
-			fprintf(stderr, "[eperezma %s:%d][i=%zu][q_fd=%d]\n", __func__, __LINE__, i, q_fd);
-			pollfds[nfds].fd = q_fd;
-			pollfds[nfds].events = revents;
-			vqs[nfds] = vq;
-			nfds++;
-		}
-
-		/* TODO: Avoid so many calls to poll! Store all descs in a list
-		 * and iterate before poll
-		 */
-		fprintf(stderr, "[eperezma %s:%d][nfds=%ld][fd0=%d][fd1=%d][fd2=%d][fd3=%d]\n", __func__, __LINE__, nfds, pollfds[0].fd, pollfds[1].fd, pollfds[2].fd, pollfds[3].fd);
-		r = poll(pollfds, nfds, infinite_timeout);
-                fprintf(stderr, "[DEBUG poll r=%d][errno=%d]\n", r, errno);
-
-		/* TODO: Include exit signal */
-		if (r <= 0) {
-			fprintf(stderr, "[ERR %s:%d][r=%d][errno=%d] poll error\n", __func__, __LINE__, r, errno);
-			if (errno == EINTR) {
-				return 0;
+			struct fuse_session *se = fuse->se;
+			if (fuse_session_exited(se)) {
+				/* Intruct caller we need to exit */
+				errno = EAGAIN;
+				return -1;
 			}
-			assert(0);
-		}
-		if (fuse_session_exited(se)) {
-			/* Intruct caller we need to exit */
-			errno = EAGAIN;
-			return -1;
+
+			/* It is important to fill the data in every iteration, as
+			 * vduse may change the number of queues */
+			for (size_t i = 2; i < nfds; ++i) {
+				VduseVirtq *vq = vduse_dev_get_queue(vdev->dev, i - 2);
+				int q_fd = vduse_queue_get_fd(vq);
+
+				fprintf(stderr, "[eperezma %ld:%s:%d][i=%zu][q_fd=%d]\n", (long int)pthread_self(), __func__, __LINE__, i, q_fd);
+				pollfds[i].fd = q_fd;
+				pollfds[i].events = revents;
+			}
+
+			fprintf(stderr, "[eperezma %ld:%s:%d][nfds=%ld][fd0=%d][fd1=%d][fd2=%d][fd3=%d]\n", (long int)pthread_self(), __func__, __LINE__, nfds, pollfds[0].fd, pollfds[1].fd, pollfds[2].fd, pollfds[3].fd);
+			r = poll(pollfds, nfds, infinite_timeout);
+			// fprintf(stderr, "[DEBUG poll r=%d][errno=%d]\n", r, errno);
+
+			/* TODO: Include exit signal */
+			if (r <= 0) {
+				fprintf(stderr, "[ERR %s:%d][r=%d][errno=%d] poll error\n", __func__, __LINE__, r, errno);
+				if (errno == EINTR) {
+					return -1;
+				}
+				assert(0);
+			}
+
+			for (nfds_t i = 0; i < nfds; ++i) {
+				assert(!(pollfds[0].revents & POLLNVAL));
+				if (pollfds[i].revents & POLLERR) {
+					int error = 0;
+
+					getsockopt(pollfds[i].fd, SOL_SOCKET, SO_ERROR, (void *)&error, (socklen_t []){sizeof(error)});
+					fprintf(stderr, "[eperezma %ld:%s:%d][POLLERR i=%lu error=%d]\n", (long int)pthread_self(), __func__, __LINE__, i, error);
+					assert(!"Returned pollerr");
+
+				} else if (pollfds[i].revents & POLLHUP) {
+					fprintf(stderr, "[POLLHUP]\n");
+				} else if (pollfds[i].revents & revents) {
+					new_ready_vqs |= (1ULL<<i);
+				}
+			}
+
+			vdev->ready_vqs |= new_ready_vqs;
 		}
 
-		if (pollfds[0].revents) {
+		if (vdev->ready_vqs & 1) {
 			size_t num_enabled_queues = vdev->num_enabled_queues;
 
-			if (pollfds[0].revents & POLLERR) {
-				int error = 0;
-
-				getsockopt(pollfds[0].fd, SOL_SOCKET, SO_ERROR, (void *)&error, (socklen_t []){sizeof(error)});
-				fprintf(stderr, "[eperezma %s:%d][POLLERR error=%d]\n", __func__, __LINE__, error);
-				assert(!"Returned pollerr");
-			}
-			if (pollfds[0].revents & POLLHUP) {
-				fprintf(stderr, "[POLLHUP]\n");
-			}
-			assert(!(pollfds[0].revents & POLLNVAL));
 			r = vduse_dev_handler(vdev->dev);
-			// We know for sure vq fd is eventfd
-			fprintf(stderr, "[DEBUG read r=%d][errno=%d]\n", r, errno);
 			if (r < 0) {
 				if (errno == EAGAIN) {
 					continue;
@@ -5067,47 +5072,54 @@ static ssize_t vdpa_read_int(void *buf, size_t buf_len, struct fuse *fuse,
 				}
 				assert(0);
 			}
+			if (!num_enabled_queues &&
+			    vdev->num_enabled_queues == VDUSE_NUM_QUEUES) {
+				fuse_log(FUSE_LOG_NOTICE, "fuse: mounting device\n");
+			}
+			vdev->ready_vqs &= ~(typeof(vdev->ready_vqs))1;
 			if (num_enabled_queues &&
-			    vdev->num_enabled_queues == 0) {
+					vdev->num_enabled_queues == 0) {
 				return -ENODEV;
 			}
 
 			continue;
 		}
 
-		if (pollfds[1].revents) {
-			assert(!(pollfds[0].revents & POLLERR));
-			if (pollfds[0].revents & POLLHUP) {
-				fprintf(stderr, "[POLLHUP]\n");
-			}
-			assert(!(pollfds[0].revents & POLLNVAL));
+		if (vdev->ready_vqs & (1<<1)) {
+			assert(!"Please remove this fd");
 			return 0;
 		}
 
 		for (nfds_t i = 2; i < nfds; ++i) {
-			uint64_t read_val;
-			if (!(pollfds[i].revents & revents)) {
+			VduseVirtq *vq;
+
+			if (!(vdev->ready_vqs & (1<<i))) {
 				continue;
 			}
 
 			assert(!cur_elem);
-			cur_elem = vduse_queue_pop(vqs[i], sizeof(*cur_elem));
+			vq = vduse_dev_get_queue(vdev->dev, i - 2);
+			cur_elem = vduse_queue_pop(vq, sizeof(*cur_elem));
 			if (cur_elem) {
-				cur_elem->vq = vqs[i];
+				cur_elem->vq = vq;
 				break;
 			} else {
 				/* Remove poll */
-				r = read(pollfds[i].fd, &read_val, sizeof(read_val));
+				int q_fd = vduse_queue_get_fd(vq);
+				r = read(q_fd, (int[]){0}, sizeof(int));
 				/* Either another thread removed data or we are removing it */
 				if (!(r == 8 || (r == -1 && errno == EAGAIN))) {
 					fprintf(stderr, "[eperezma %s:%d] Cannot read %d: %s(%d)", __func__, __LINE__, r, strerror(errno), errno);
 				}
 				assert(r == 8 || (r == -1 && errno == EAGAIN));
-				cur_elem = vduse_queue_pop(vqs[i], sizeof(*cur_elem));
+				cur_elem = vduse_queue_pop(vq, sizeof(*cur_elem));
 				if (cur_elem) {
-					cur_elem->vq = vqs[i];
+					cur_elem->vq = vq;
 					break;
+				} else {
+					vdev->ready_vqs &= ~(typeof(vdev->ready_vqs))(1ULL << i);
 				}
+
 			}
 		}
         } while (!cur_elem);
