@@ -168,8 +168,10 @@ static void *fuse_do_work(void *data)
 
 		if (!isforget)
 			mt->numavail--;
+#if 0
 		if (mt->numavail == 0 && mt->numworker < mt->max_threads)
 			fuse_loop_start_thread(mt);
+#endif
 		pthread_mutex_unlock(&mt->lock);
 
 		fuse_session_process_buf_internal(mt->se, &w->fbuf, w->ch);
