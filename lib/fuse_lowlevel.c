@@ -2874,6 +2874,9 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 		fuse_ll_ops[in->opcode].func(req, in->nodeid, inarg);
 
 out_free:
+	assert(cur_elem);
+	free(cur_elem);
+	cur_elem = NULL;
 	free(mbuf);
 	return;
 

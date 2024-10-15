@@ -8,6 +8,7 @@
 
 #include "fuse.h"
 #include "fuse_lowlevel.h"
+#include <threads.h>
 
 #include <stdbool.h>
 
@@ -154,6 +155,8 @@ struct fuse_loop_config
 	unsigned int max_threads;
 };
 #endif
+
+extern thread_local struct fuse_cb_virtq_elem *cur_elem;
 
 /* ----------------------------------------------------------- *
  * Channel interface (when using -o clone_fd)		       *

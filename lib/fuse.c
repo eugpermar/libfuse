@@ -195,6 +195,7 @@ extern fuse_module_factory_t fuse_module_iconv_factory;
 #endif
 
 static pthread_key_t fuse_context_key;
+thread_local struct fuse_cb_virtq_elem *cur_elem;
 static pthread_mutex_t fuse_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static int fuse_context_ref;
 static struct fuse_module *fuse_modules = NULL;
