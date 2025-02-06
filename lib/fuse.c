@@ -5023,12 +5023,12 @@ static ssize_t vdpa_read_int(void *buf, size_t buf_len, struct fuse *fuse,
 				VduseVirtq *vq = vduse_dev_get_queue(vdev->dev, i - 2);
 				int q_fd = vduse_queue_get_fd(vq);
 
-				fprintf(stderr, "[eperezma %ld:%s:%d][i=%zu][q_fd=%d]\n", (long int)pthread_self(), __func__, __LINE__, i, q_fd);
+				// fprintf(stderr, "[eperezma %ld:%s:%d][i=%zu][q_fd=%d]\n", (long int)pthread_self(), __func__, __LINE__, i, q_fd);
 				pollfds[i].fd = q_fd;
 				pollfds[i].events = revents;
 			}
 
-			fprintf(stderr, "[eperezma %ld:%s:%d][nfds=%ld][fd0=%d][fd1=%d][fd2=%d][fd3=%d]\n", (long int)pthread_self(), __func__, __LINE__, nfds, pollfds[0].fd, pollfds[1].fd, pollfds[2].fd, pollfds[3].fd);
+			// fprintf(stderr, "[eperezma %ld:%s:%d][nfds=%ld][fd0=%d][fd1=%d][fd2=%d][fd3=%d]\n", (long int)pthread_self(), __func__, __LINE__, nfds, pollfds[0].fd, pollfds[1].fd, pollfds[2].fd, pollfds[3].fd);
 			r = poll(pollfds, nfds, infinite_timeout);
 			// fprintf(stderr, "[DEBUG poll r=%d][errno=%d]\n", r, errno);
 
@@ -5141,7 +5141,7 @@ static ssize_t vdpa_read_int(void *buf, size_t buf_len, struct fuse *fuse,
 	written = fuse_buf_copy(vdev->dst, vdev->src, /*no flags */ 0);
 
 	in = buf;
-        fprintf(stderr, "[DEBUG %s:%d][vq=%p][POP elem=%p][in->opcode=%u]\n", __func__, __LINE__, cur_elem->vq, cur_elem, in->opcode);
+        // fprintf(stderr, "[DEBUG %s:%d][vq=%p][POP elem=%p][in->opcode=%u]\n", __func__, __LINE__, cur_elem->vq, cur_elem, in->opcode);
 	if (in->opcode == FUSE_FORGET
 	    /* || in->opcode == FUSE_BATCH_FORGET */) {
 		/* This opcode does not return data to the driver so
@@ -5194,7 +5194,7 @@ static ssize_t vdpa_writev(int fd, struct iovec *iov, int count,
 	written = fuse_buf_copy(vdev->dst, vdev->src, /*no flags */ 0);
         vduse_queue_push(cur_elem->vq, &cur_elem->elem, written);
         vduse_queue_notify(cur_elem->vq);
-        fprintf(stderr, "[DEBUG %s:%d][vq=%p][PUSH elem=%p written=%zu][len=%u][error=%d][unique=%lu]\n", __func__, __LINE__, cur_elem->vq, cur_elem, written, out->len, out->error, out->unique);
+        // fprintf(stderr, "[DEBUG %s:%d][vq=%p][PUSH elem=%p written=%zu][len=%u][error=%d][unique=%lu]\n", __func__, __LINE__, cur_elem->vq, cur_elem, written, out->len, out->error, out->unique);
 
         return written;
 }
